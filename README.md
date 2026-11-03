@@ -37,6 +37,7 @@ Tests and mock examples do not need Codex CLI. Live runs currently use the
 [Codex CLI provider](docs/codex-provider.md), authenticated through ChatGPT:
 
 ```console
+npm install -g @openai/codex
 codex login
 codex login status
 ```
@@ -47,6 +48,14 @@ noninteractive, read-only, ephemeral execution, sends task data through stdin an
 reads the separate final response file. Agents validate the returned JSON; invalid
 output is not repaired or retried. An API-based provider is not implemented, but
 another runtime can implement `LLMProvider.generate(request: str) -> str`.
+
+To check the real Codex CLI provider with a synthetic grading example:
+
+```console
+python -m krugradeai.smoke_codex --live
+```
+
+This makes a live request; it is not a real-dataset evaluation.
 
 ## Run the Development loop
 
