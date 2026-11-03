@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+build/
+dist/
+artifacts/
+# Private source datasets and generated experimental data stay local.
+/data/
+/private-data/
+/local-config/
+# Keep the reviewed final prompt bundle; ignore ad-hoc regenerated exports.
+/exports/*
+!/exports/final-grader-prompts/
+# Local credentials and machine-specific configuration.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.aws/
+.codex/
+.pytest_cache/
+.coverage
+htmlcov/
