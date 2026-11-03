@@ -1,0 +1,8 @@
+{
+  "development": "synthetic-development.jsonl",
+  "output_directory": "../../artifacts/reusable-optimization-example-001",
+  "runtime": "synthetic_mock",
+  "max_iterations": 1,
+  "max_calls": 10,
+  "initial_rules": {"rules": []}
+}

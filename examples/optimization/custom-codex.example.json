@@ -1,0 +1,10 @@
+{
+  "development": "custom-development.jsonl",
+  "output_directory": "../../artifacts/custom-optimization-001",
+  "runtime": "codex_cli",
+  "model": "REPLACE_WITH_MODEL_ID",
+  "timeout_seconds": 120,
+  "max_iterations": 1,
+  "max_calls": 100,
+  "initial_rules": {"rules": []}
+}
