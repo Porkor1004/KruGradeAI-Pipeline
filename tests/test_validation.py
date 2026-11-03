@@ -234,3 +234,44 @@ class BestGuidelinesRegressionTests(unittest.TestCase):
         self.assertIn("VALIDATION_FEEDBACK_SENTINEL", result.model_dump_json())
         for request in (*reflector.requests, *refiner.requests):
             self.assertNotIn("VALIDATION_", request.model_dump_json())
+
+    def test_duplicate_development_response_rejected_before_baseline_calls(self):
+        first = fixtures.development()
+        data = first.model_dump()
+        data['id'] = 'different-development-id'
+        duplicate = type(first).model_validate(data)
+        grader = ValidationGrader()
+        optimizer = OptimizationLoop(grader=grader, reflector=fixtures.ScriptedReflector(),
+                                     refiner=fixtures.ScriptedRefiner(), max_iterations=1)
+        with self.assertRaises(ValueError):
+            optimizer.run([first, duplicate], validation_records=[validation()])
+        self.assertEqual(grader.requests, [])
+
+    def test_duplicate_development_source_item_rejected_even_with_new_response_id(self):
+        data = fixtures.development().model_dump()
+        data['provenance'] = dict(source='synthetic-source', item_id='same-source-row')
+        first = fixtures.DevelopmentRecord.model_validate(data)
+        data['id'] = 'different-id'
+        data['response']['id'] = 'different-response-id'
+        second = fixtures.DevelopmentRecord.model_validate(data)
+        grader = ValidationGrader()
+        optimizer = OptimizationLoop(grader=grader, reflector=fixtures.ScriptedReflector(),
+                                     refiner=fixtures.ScriptedRefiner(), max_iterations=1)
+        with self.assertRaises(ValueError):
+            optimizer.run([first, second])
+        self.assertEqual(grader.requests, [])
+        from krugradeai.validation import prepare_validation
+        with self.assertRaises(ValueError):
+            prepare_validation((first, second), [validation()], ValidationConfig())
+
+    def test_source_item_ids_are_scoped_by_source_not_guessed_from_answer_text(self):
+        data = fixtures.development('dev-one').model_dump()
+        data['provenance'] = dict(source='source-a', item_id='row-1')
+        first = fixtures.DevelopmentRecord.model_validate(data)
+        data['id'] = 'dev-two'
+        data['response']['id'] = 'other-response'
+        data['provenance']['source'] = 'source-b'
+        second = fixtures.DevelopmentRecord.model_validate(data)
+        from krugradeai.validation import prepare_validation
+        groups = prepare_validation((first, second), [validation()], ValidationConfig())
+        self.assertEqual(len(groups), 1)

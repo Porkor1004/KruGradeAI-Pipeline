@@ -201,3 +201,21 @@ source isolation, overlap, immutable labels and independent paths. Existing
 Step 6 and provider tests remain unchanged. All agent/provider execution in the
 suite is mocked. No held-out final evaluation is implemented: selected validation
 performance remains a selection result, not a final unbiased test estimate.
+
+
+## Known-identity checks
+
+Development records must have unique record IDs, `(question.id, response.id)`
+identities and `(provenance.source, provenance.item_id)` pairs when provenance is
+present. The optimizer rejects known duplicates before any agent invocation, with
+or without Validation. Validation preparation applies the same Development check
+and its existing within-Validation and cross-partition checks. ExperimentDataset
+also rejects known overlaps across Development, Validation and Held-out partitions.
+
+These keys identify records, not every related student attempt. The generic
+provenance contract has no attempt/group/ancestry fields, so new IDs can hide
+relationships it cannot establish. The real-data adapter separately connects
+explicit attempt IDs, response ancestry and source-file lineage before partitioning;
+those manifest checks must be retained when using its prepared data. Identical
+answer text alone is not treated as a reliable identity link. No new split,
+relationship inference or source-label change is introduced by these checks.

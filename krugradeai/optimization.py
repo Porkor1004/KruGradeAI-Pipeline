@@ -14,7 +14,7 @@ from krugradeai.optimization_models import (
     ValidationConfig, ValidationRecord,
 )
 from krugradeai.refiner import validate_candidate_rules
-from krugradeai.validation import ValidationTracker, prepare_validation
+from krugradeai.validation import ValidationTracker, prepare_validation, _validate_unique_identities
 
 
 def _has_discrepancy(record: GradingRecord, example: DevelopmentRecord) -> bool:
@@ -68,6 +68,7 @@ class OptimizationLoop:
             raise ValueError("At least one development record is required")
         if len({r.id for r in records}) != len(records):
             raise ValueError("Development record IDs must be unique")
+        _validate_unique_identities(records)
         rules = AdaptationRules.model_validate(initial_rules if initial_rules is not None else AdaptationRules())
         groups: dict[str, list[DevelopmentRecord]] = {}
         for record in records:

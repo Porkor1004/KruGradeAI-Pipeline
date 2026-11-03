@@ -97,3 +97,79 @@ class PortableOptimizationTests(unittest.TestCase):
         a.generate('one')
         with self.assertRaises(RuntimeError): b.generate('two')
         self.assertEqual(len(source.requests),1)
+
+    def test_provider_setup_failure_records_safe_status_and_preserves_output(self):
+        before = self.input.read_bytes()
+        with patch('krugradeai.run_optimization.build_mock_agents', side_effect=RuntimeError('PRIVATE ANSWER')):
+            with self.assertRaises(RuntimeError):
+                run(self.config)
+        output = self.root/'output'
+        status = json.loads((output/'status.json').read_bytes())
+        self.assertEqual(status, dict(status='failed', stage='providers', provider_calls=0, error_type='RuntimeError'))
+        self.assertTrue((output/'configuration.json').exists())
+        self.assertNotIn('PRIVATE', (output/'status.json').read_text())
+        saved = {p.name: p.read_bytes() for p in output.iterdir()}
+        with self.assertRaises(FileExistsError):
+            run(self.config)
+        self.assertEqual(saved, {p.name: p.read_bytes() for p in output.iterdir()})
+        self.assertEqual(before, self.input.read_bytes())
+
+    def test_interruption_and_unexpected_loop_error_have_distinct_safe_status(self):
+        for number, error in enumerate((KeyboardInterrupt(), RuntimeError('PRIVATE PROMPT'))):
+            self.write_config(output_directory=f'output-{number}')
+            with patch('krugradeai.run_optimization.OptimizationLoop.run', side_effect=error):
+                with self.assertRaises(type(error)):
+                    run(self.config)
+            status = json.loads((self.root/f'output-{number}'/'status.json').read_bytes())
+            self.assertEqual(status['status'], 'interrupted' if number == 0 else 'failed')
+            self.assertEqual(status['stage'], 'optimization')
+            self.assertEqual(status['provider_calls'], 0)
+            self.assertNotIn('PRIVATE', json.dumps(status))
+
+    def test_artifact_write_failure_retains_configuration_and_call_count(self):
+        original = Path.open
+        def failing_open(path, *args, **kwargs):
+            if path.name == 'optimization.json':
+                raise OSError('PRIVATE STORAGE PATH')
+            return original(path, *args, **kwargs)
+        with patch.object(Path, 'open', failing_open):
+            with self.assertRaises(OSError):
+                run(self.config)
+        output = self.root/'output'
+        status = json.loads((output/'status.json').read_bytes())
+        self.assertEqual(status['status'], 'failed')
+        self.assertEqual(status['stage'], 'artifacts')
+        self.assertEqual(status['provider_calls'], 10)
+        self.assertTrue((output/'configuration.json').exists())
+        self.assertFalse((output/'summary.json').exists())
+        self.assertNotIn('PRIVATE', json.dumps(status))
+
+    def test_captured_agent_failure_is_incomplete_not_completed(self):
+        from krugradeai.synthetic import build_mock_agents
+        agents = build_mock_agents()
+        agents[0].provider = MockLLMProvider('{}')  # Invalid synthetic grade, caught by the engine.
+        with patch('krugradeai.run_optimization.build_mock_agents', return_value=agents):
+            summary = run(self.config)
+        self.assertEqual(summary['status'], 'incomplete')
+        self.assertTrue(all(p['stop_reason'] == 'agent_failure' for p in summary['paths']))
+        status = json.loads((self.root/'output'/'status.json').read_bytes())
+        self.assertEqual(status['status'], 'incomplete')
+        self.assertEqual(status['provider_calls'], 4)
+        self.assertTrue((self.root/'output'/'optimization.json').exists())
+
+    def test_cli_incomplete_run_has_nonzero_exit_without_live_calls(self):
+        from krugradeai.run_optimization import main
+        with patch('krugradeai.run_optimization.run', return_value={'status':'incomplete'}), patch('builtins.print'):
+            self.assertEqual(main(['--config',str(self.config)]), 1)
+        with patch('krugradeai.run_optimization.run', return_value={'status':'completed'}), patch('builtins.print'):
+            self.assertEqual(main(['--config',str(self.config)]), 0)
+
+    def test_duplicate_source_item_is_rejected_during_preflight(self):
+        rows = [r.model_dump(mode='json') for r in self.records]
+        rows[1]['provenance'] = rows[0]['provenance']
+        self.input.write_text(''.join(json.dumps(row)+'\n' for row in rows))
+        with patch('krugradeai.run_optimization.build_mock_agents') as build:
+            with self.assertRaises(ValueError):
+                run(self.config, dry_run=True)
+        build.assert_not_called()
+        self.assertFalse((self.root/'output').exists())

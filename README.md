@@ -1,38 +1,27 @@
-# KruGradeAI Phase 1
+# KruGradeAI Pipeline
 
-KruGradeAI studies whether rubric-preserving adaptation rules can improve AI
-grading agreement without fine-tuning. The pipeline is **Grader → Reflector →
-Refiner → candidate Validation → best-guidelines selection → frozen Held-out
-Evaluation**. A successful software workflow does not establish grading gains
-or transfer to new questions.
+KruGradeAI is a Python implementation of a GradeOpt-inspired grading workflow.
+It updates grading instructions from labeled Development examples without
+fine-tuning the model or changing the teacher rubric.
 
-## Architecture
+The three agents have separate jobs:
 
-- Frozen Pydantic models validate criterion scores, partial credit, totals and
-  rubric identity. Grader inputs exclude reference labels.
-- Provider-backed Grader, Reflector and Refiner use the runtime-neutral
-  `LLMProvider`. Refiner returns adaptation rules only, never edited rubrics.
-- `optimization.py` manages independent rubric paths, discrepancy evidence,
-  explicit failures/reviews and iteration limits. Human-only Validation selects
-  eligible candidates; ties retain the earlier version and incomplete coverage
-  cannot qualify a candidate.
-- Optional Development-only AI adjudication uses an independent score-blind
-  assessment before comparison. Its findings are experimental AI evidence,
-  not human verification. Unresolved cases remain excluded.
-- `final_evaluation.py` freezes exact selected rules and checks split, source and
-  code hashes before final evaluation. Held-out feedback never reaches Refiner.
+- **Grader** scores each rubric criterion and explains the award. It receives the
+  question, optional reference solution, rubric, student answer and adaptation
+  rules, but no reference scores.
+- **Reflector** compares a Development grade with its reference labels and looks
+  for supported discrepancies. Missing criterion labels are not inferred from
+  a total score.
+- **Refiner** proposes adaptation rules from supported findings. It cannot edit
+  the rubric, score bounds or source labels. Unresolved evidence can stop refinement.
 
-See [architecture](docs/architecture.md), [experiment report](docs/phase1_experiment_report.md)
-and [metrics summary](docs/phase1_evaluation_metrics_summary.md).
+Frozen Pydantic models and Decimal scores enforce criterion coverage, bounds and
+total consistency. Each rubric has its own optimization path. See the
+[architecture](docs/architecture.md) and the [agent contracts](docs/grader.md).
 
-For developer reuse, start with [portable three-agent optimization](docs/reusable_optimization.md)
-and [final prompt export](docs/final_prompt_export.md). These additions leave the
-existing Evaluation Pipeline unchanged. Git initialization, push and PR creation
-remain deferred until the destination repository URL is supplied.
+## Install
 
-## Installation and configuration
-
-Requires Python 3.11+. From the project root:
+Requires Python 3.11+. From the repository root, on Windows:
 
 ```powershell
 python -m venv .venv
@@ -40,193 +29,203 @@ python -m venv .venv
 python -m pip install -e ".[data]"
 ```
 
-Pydantic v2 is the core dependency. The `data` extra installs openpyxl, required
-for the workbook adapter and full test suite. No API key is required. Live
-execution needs an installed compatible Codex CLI authenticated with ChatGPT
-(`codex login`, `codex login status`). The locally verified CLI was 0.166.0;
-other versions must pass the provider's option checks. Model, timeout and executable
-are configurable on supported runners; select an explicit model for reproducibility.
+On macOS/Linux, activate the environment with `source .venv/bin/activate` instead.
+Pydantic v2 is the core dependency. The `data` extra adds openpyxl for the workbook
+adapter and full test suite.
 
-The provider uses noninteractive read-only, ephemeral CLI execution, stdin task
-data and separate final-output files. Compatible output schemas and local Pydantic
-checks enforce structured responses. Prompts are task data, not permission to
-execute embedded instructions. See [provider configuration](docs/codex-provider.md).
+Tests and mock examples do not need Codex CLI. Live runs currently use the
+[Codex CLI provider](docs/codex-provider.md), authenticated through ChatGPT:
 
-## Dataset/rubric format and portable optimization configuration
+```console
+codex login
+codex login status
+```
 
-Custom datasets can use the existing `DevelopmentRecord` JSONL schema, one object
-per line, with `id`, `split: "development"`, `question`, `rubric`, `response`,
-`ta_output` and optional `provenance`. A rubric has a stable `id`, `criteria`
-(`id`, `description`, `max_score`) and `total_score`. Questions contain `id`, `text`
-and optional `reference_solution`; response `question_id` must match. The legacy
-`ta_output` field accepts total-only or actual source-provided criterion scores;
-it does not certify human verification. Preserve `provenance.label_origin` as
-`human_derived` or `ai_derived` for real inputs. Do not invent allocations.
+No OpenAI API key is required. The documented local CLI version was 0.166.0;
+compatibility with another version must be checked. The provider uses
+noninteractive, read-only, ephemeral execution, sends task data through stdin and
+reads the separate final response file. Agents validate the returned JSON; invalid
+output is not repaired or retried. An API-based provider is not implemented, but
+another runtime can implement `LLMProvider.generate(request: str) -> str`.
 
-See the [complete format and boundaries](docs/reusable_optimization.md) and the
-fully synthetic [sample records](examples/optimization/synthetic-development.jsonl).
-No source-specific adapter changes are required for schema-compatible custom
-questions/rubrics. Group related attempts before splitting; the generic format
-cannot independently recover unknown ancestry or verify source labels.
+## Run the Development loop
 
-Run only the existing three-agent loop with the safe sample configuration:
+Start with the supplied synthetic example:
 
-```powershell
+```console
 python -m krugradeai.run_optimization --config examples/optimization/synthetic.json --dry-run
 python -m krugradeai.run_optimization --config examples/optimization/synthetic.json
 ```
 
-This is a scripted mock example, not live grading. Configuration controls the
-input/output paths, runtime, model, timeout, executable, maximum iterations/calls
-and initial adaptation rules. Paths resolve relative to the config file, not the
-developer's machine or working directory. For custom live inputs, copy the
-[configuration template](examples/optimization/custom-codex.example.json), replace
-its placeholders, validate with `--dry-run` and use `--live` only after intentional
-authorization. A shared call cap bounds all three agents; no retries/resume or
-overwriting prior outputs is supported.
+The first command validates the inputs and prints a call reservation. The second
+runs the existing Grader–Reflector–Refiner loop with scripted mock providers. It
+uses four synthetic records across two rubric paths; it does not measure grading
+accuracy. The mock runtime accepts only the supplied fixtures.
 
-Outputs are `configuration.json`, `optimization.json` and `summary.json` under
-the configured fresh output directory. History can contain private Development
-answers/labels; keep it under ignored `artifacts/`. This entry point does not load
-Validation/Test or call evaluation. Its latest proposal is **not** a best-guidelines
-claim. Existing Python/real-runner Validation selection remains available unchanged.
+For custom data, copy the
+[Codex configuration template](examples/optimization/custom-codex.example.json),
+replace its model and file-path placeholders, then run:
 
-## Export and independently use final grading prompts
-
-The [final export bundle](exports/final-grader-prompts/manifest.json) contains Q1–Q8
-definitions and readable instruction templates. Q5/Q7 use the exact frozen G1;
-all other paths retain G0. No rules were regenerated. Each question has:
-
-- `Qn.grader.txt`: exact Grader request template with question/reference, immutable
-  rubric and selected rules, plus an explicitly marked answer placeholder.
-- `Qn.codex-stdin.txt`: exact textual Codex runtime envelope around that template.
-- `Qn.json`: portable question/rubric/rule definition without answers or labels.
-
-**These are task-text instructions, not verified native system messages.** The
-current provider sends one stdin string to `codex exec`; its runtime policy and
-Grader prompt are text layers. Replace the response through the existing typed
-input rather than treating the placeholder as an answer. `PromptDefinition` and
-`render_prompt` support standalone use without the optimizer/private dataset.
-Do not pass an already wrapped stdin template to the provider and wrap it twice.
-
-To export again from the existing private frozen/source evidence into a fresh
-directory, without LLM calls:
-
-```powershell
-python -m krugradeai.prompt_export --frozen artifacts/real-final-evaluation/frozen-guidelines-full-001.json --output-dir exports/final-grader-prompts-new
+```console
+python -m krugradeai.run_optimization --config PATH_TO_CONFIG.json --dry-run
+python -m krugradeai.run_optimization --config PATH_TO_CONFIG.json --live
 ```
 
-See [export details and standalone usage](docs/final_prompt_export.md). Hashes verify
-exact normalized frozen rubric/rule content; no original student answers, scores
-or Validation findings are exported. Original exam/reference/rubric redistribution
-rights still require confirmation before GitHub publication. The exported model
-instructions alone do not enforce sandboxing or local score validation.
+The second command makes live requests. Use a compatible installed CLI and choose
+an explicit model before running it. Configuration supports `development`,
+`output_directory`, `runtime`, `model`, `executable`, `timeout_seconds`,
+`max_iterations`, `max_calls` and `initial_rules`. File paths resolve relative to
+that configuration file, not the shell's working directory. Unknown fields are
+rejected. This runner allows 1–10 iterations and reserves at most
+`iterations × (2 × Development records + rubric paths)` provider calls. All three
+agents share the configured call cap.
 
-## Tests and offline demonstration
+The output directory must be new. It contains:
 
-```powershell
-python -m unittest discover -s tests -v
-```
+| File | Contents |
+| --- | --- |
+| `configuration.json` | Resolved run configuration |
+| `optimization.json` | Rule versions, grades, reflections, failures and review history |
+| `summary.json` | Path stop reasons, latest versions and provider-call count |
+| `status.json` | Execution state, last stage and call count; sanitized error type on failure |
 
-Tests use synthetic fixtures and mocked subprocess/providers, with no live LLM
-calls. A separate deterministic synthetic demonstration is available:
+A failed or interrupted run retains its partial files and cannot reuse the same
+output path. Inspect those files before starting a separate run; there is no
+resume or automatic retry. Agent failures or unresolved review outcomes produce
+an `incomplete` status and a nonzero CLI exit. If storage itself fails, even the
+status file may be missing or stale. Keep outputs under ignored `artifacts/`:
+optimization history can contain private answers and labels.
 
-```powershell
-python -m krugradeai.demo --experiment-id synthetic-new-demo --output-dir artifacts/synthetic-new-demo
-```
+**This entry point optimizes Development only.** It does not load Validation or
+Held-out data, select best guidelines or enable AI adjudication. The latest
+candidate is a proposal, not evidence of improvement.
 
-Use a fresh declared synthetic experiment/output location; execution receipts
-prevent accidental repeats. Synthetic metrics are software checks, not real accuracy.
-See [demo instructions](docs/end-to-end.md).
+## Data and rubrics
 
-## Real data and optimization
+The portable runner reads UTF-8 JSONL with one `DevelopmentRecord` per line.
+Each record contains `id`, `split: "development"`, `question`, `rubric`, `response`,
+`ta_output` and optional `provenance`. See the
+[synthetic records](examples/optimization/synthetic-development.jsonl) and
+[full input format](docs/reusable_optimization.md).
 
-Original files in `data/raw/` and all generated `artifacts/` remain local and are
-excluded from version control. Do not upload student data, local credentials or
-execution transcripts. A fresh checkout does not contain prepared real records,
-official JSON evidence or frozen guidelines. Obtain these through approved private
-storage; do not fabricate replacements. Documentation links to local artifacts
-require that private evidence bundle. Source hashes and lineage must match.
+Questions have an ID, text and optional reference solution. Rubrics have a stable
+ID, uniquely identified criteria with descriptions and positive maxima, and a
+`total_score` equal to their sum. Response `question_id` must match the question.
+Use decimal strings for scores. A rubric path must refer to the same question and
+rubric throughout a run. Custom subjects can use these schemas without changing
+core source code; the existing workbook/ZIP adapter is examination-specific.
 
-The deterministic adapter uses confirmed question/rubric scopes, groups related
-attempts before splitting, preserves label provenance and quarantines unresolved
-inputs. See [dataset audit](docs/real_dataset_audit.md), [scope reconciliation](docs/question_scope_reconciliation.md)
-and [preparation](docs/real_data_preparation.md). Existing prepared outputs must not
-be overwritten or resplit for reproducing this experiment.
+`ta_output` is the legacy name for reference scores, not proof that a TA supplied
+them. It accepts totals with complete, partial or absent criterion labels. Retain
+real label provenance as `human_derived` or `ai_derived`; AI labels are operational
+pseudo-ground truth, not human verification. Initial adaptation rules must be
+compatible with every path in the configuration.
 
-Inspect a full optimization plan without providers:
+Known record, response and source/item duplicates are rejected. For new datasets,
+group related attempts and derived answers before splitting. Generic records do
+not retain the real adapter's full attempt/ancestry metadata, so different IDs
+cannot establish independence. Matching answer text alone does not prove overlap.
+Do not upload private input files, credentials or generated history.
 
-```powershell
+## Validation and full experiments
+
+The Python `OptimizationLoop.run(..., validation_records=...)` interface supports
+candidate evaluation and selection. It evaluates G0 and changed candidates on a
+fixed Validation population, requires complete comparison coverage, and retains
+the earlier eligible version on ties or regressions. Patience and minimum-delta
+settings control stopping. Selected rules are stored in
+`path.validation.best_rules` and `best_version`, separately from `final_version`.
+See [optimization](docs/optimization.md) and [Validation](docs/validation.md).
+
+The separate `optimize_real` runner handles the existing source-specific experiment:
+95 Development records, 19 human-derived Validation records and eight rubric paths.
+Its opt-in AI adjudication performs an independent score-blind assessment before
+label comparison. Supported results remain AI evidence; unresolved records are
+excluded from refinement. With the private prepared data and criterion supplement
+available, inspect its single-iteration plan with:
+
+```console
 python -m krugradeai.optimize_real --full-development --ai-adjudication --dry-run --max-calls 332
 ```
 
-For a separately authorized new experiment, the live command shape is:
+This command cannot run from a source-only checkout without those inputs. See
+[full-run configuration](docs/full_real_optimization.md) and
+[data preparation](docs/real_data_preparation.md). Do not overwrite existing splits
+or treat the convenience runner as a replacement for that experiment's policies.
 
-```powershell
-python -m krugradeai.optimize_real --live --full-development --ai-adjudication --model MODEL_ID --run-id NEW_EXPERIMENT_ID --max-calls 332 --timeout 120
+`final_evaluation.py` freezes Validation-selected rules before final grading and
+compares G0 with that selection on the same Held-out records. It checks source,
+split and code hashes and claims a once-only execution receipt. Held-out feedback
+never enters refinement or selection. Its `--prepare`, `--dry-run` and `--live`
+modes require the corresponding completed experiment inputs; use
+`python -m krugradeai.final_evaluation --help` for arguments. Do not reset receipts
+or rerun a consumed experiment under another ID.
+
+Private datasets, frozen guidelines, official reports and real-exam prompt exports
+are not included in this repository. The separate full synthetic demonstration is
+available through `python -m krugradeai.demo --help`; its default runtime is mocked.
+Synthetic results are software checks, not measurements of real grading accuracy.
+
+## Export grading instructions
+
+Given a frozen selection and its matching private source evidence:
+
+```console
+python -m krugradeai.prompt_export --frozen PATH_TO_FROZEN_GUIDELINES.json --output-dir exports/new-prompts
 ```
 
-Replace placeholders before use. This does not resume the completed experiment.
-One iteration uses all 95 Development records and 19 human Validation records,
-with a shared maximum of 332 provider calls when adjudication is enabled. Do not
-rerun the completed experiment as submission preparation. See [full-run safeguards](docs/full_real_optimization.md).
+The exporter validates the selection and uses Development question/reference text.
+It writes per-scope JSON definitions, readable Grader request templates, Codex stdin
+templates and a hash manifest. It preserves the normalized rubric and selected rules,
+exports no actual student answers or reference scores, and refuses overwrite.
 
-## Frozen final evaluation and outputs
+These are task-text templates, not native system-role messages. `PromptDefinition`
+and `render_prompt` can assemble a new typed request without running the optimizer.
+Pass the plain request to the provider; it adds its own runtime envelope. The text
+alone does not enforce sandboxing or score validation. See
+[prompt export](docs/final_prompt_export.md) for details. The historical Q1–Q8 bundle
+is excluded; regeneration also needs the private artifact paths and hashes to match.
+Confirm redistribution rights before sharing exam questions or reference solutions.
 
-The official evaluation has already consumed its once-only attempt. Inspect the
-frozen plan without grading:
+## Tests and metrics
 
-```powershell
-python -m krugradeai.final_evaluation --dry-run
+```console
+python -m unittest discover -s tests -v
 ```
 
-For an independently authorized, previously unconsumed experiment, preparation
-and execution use `--prepare` and `--live --model MODEL_ID`, respectively, with
-explicit report/data/frozen inputs. See [final evaluation](docs/final_heldout_evaluation.md)
-for the full command protocol. **Do not rerun `heldout-full-001`, reset receipts,
-or reuse its test feedback for tuning.** Changing a run ID does not authorize
-repeating the same consumed final evaluation.
+The suite uses synthetic fixtures and mocked providers/subprocesses. It does not
+run live grading or require the private experiment data. Tests cover contracts,
+agent boundaries, orchestration, selection, exports and failure handling.
 
-Local output locations include:
+Evaluation reports MAE in rubric points, normalized MAE as the mean of each
+absolute error divided by its rubric maximum, Exact Match as the fraction of
+exactly matching totals, and coverage as scored/expected records. Error and Exact
+Match use successful grades; review/failure stays in the coverage denominator and
+is never assigned a zero score. QWK is available only when explicitly configured
+ordinal categories and comparable score scales permit it. Real-data reporting
+separates human-only, AI-only and mixed cohorts.
 
-| Location | Contents |
+The previous Phase 1 documentation reports the following real experiment results.
+The supporting JSON reports are private and not shipped here, so these figures
+cannot be independently verified from this checkout:
+
+| Measure | Reported result |
 | --- | --- |
-| `artifacts/real-mixed-v1/` | Prepared partitions, manifest and quarantine |
-| `artifacts/development-criteria-v1/` | Opt-in criterion supplement and provenance |
-| `artifacts/real-optimization/real-optimization-full-001/` | Completed optimization report, plan and call journal |
-| `artifacts/real-final-evaluation/frozen-guidelines-full-001.json` | Exact frozen rules and integrity metadata |
-| `artifacts/real-final-evaluation/heldout-full-001/` | Official final report and guideline exports |
+| Development / Validation / Held-out | 95 / 19 / 24 records |
+| Development labels | 76 AI-derived, 19 human-derived |
+| Held-out labels | 19 human-derived, 5 AI-derived |
+| Full optimization | 178 provider calls; G1 evaluated for Q1/Q4/Q5/Q7/Q8 |
+| Selected guidelines | G1 for Q5/Q7; G0 elsewhere |
+| Q5 Validation MAE | 1.250 → 1.000 on two records |
+| Q7 Validation MAE | 0.625 → 0.375 on two records |
+| Mixed Held-out MAE | 0.500 → 0.500 |
+| Official Held-out coverage | 22/24 (91.67%); incomplete |
 
-Metrics include MAE, per-record normalized MAE, Exact Match and coverage. Error
-metrics use scored cases; review/failure remains in the coverage denominator and
-is never imputed as zero. Human-only, AI-only and mixed metrics are separate.
-
-## Verified results and limitations
-
-- Development: 95 (76 AI-derived, 19 human-derived); Validation: 19 human-derived;
-  Held-out: 24 (19 human-derived, 5 AI-derived), across eight rubric paths.
-- Full optimization used 178 provider calls. G1 was evaluated for Q1/Q4/Q5/Q7/Q8;
-  human Validation selected G1 only for Q5 and Q7. Their MAE changed from
-  1.250 → 1.000 and 0.625 → 0.375, respectively, on two examples per path.
-- Official Held-out status is **incomplete**: 22/24 scored (91.67%). G0 and frozen
-  best rules have identical aggregate mixed MAE, 0.500 → 0.500. No held-out gain
-  or statistical equivalence is established.
-- Historical optimization effective model is **unknown** (0/178 verified).
-  Held-out explicitly requested `gpt-6.1-sol`; historical model matching is unverified.
-- Two Q1 review IDs could not be recovered; supplementary adjudication was stopped.
-  No 24/24 AI-assisted result exists. See [recovery audit](docs/supplementary_q1_recovery_audit.md).
-- The proposed relationship between “351+ raw items” and 138 active records is
-  **not verified**. Raw rows, augmented variants and assembled parent records have
-  different units; do not present them as a proven attrition chain.
-- AI-derived labels are operational pseudo-ground truth, not human verification.
-  Small, grouped samples, transcription uncertainty and Validation reuse limit
-  generalization. Raw-source review authentication is not independently established.
-- Legacy-prompt comparison infrastructure is prepared, but the actual original
-  prompt is missing. Phase 1 G0 is not that prompt; no legacy comparison results
-  exist. See [comparison status](docs/old_prompt_baseline_comparison.md).
-
-## Submission status
-
-See [repository submission audit](docs/submission_readiness_audit.md) for checks,
-preserved artifact hashes and unresolved publication blockers. Do not publish
-private data or claim experimental limitations have been resolved.
+No observed Held-out improvement is established. The historical optimization model
+is unknown; Held-out grading reportedly used `gpt-6.1-sol`. Two Q1 review record IDs
+could not be recovered, so supplementary adjudication was not performed. The
+suggested relationship between “351+ raw items” and 138 active records is unverified.
+Small grouped samples, uncertain transcription/label provenance and Validation
+reuse limit conclusions about generalization. AI-label agreement is not human
+grading accuracy. The original legacy system prompt is still missing, so the
+baseline-comparison module has no verified real legacy-prompt result.

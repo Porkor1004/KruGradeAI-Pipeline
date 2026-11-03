@@ -21,8 +21,18 @@ def _identities(records):
     )
 
 
+def _validate_unique_identities(records):
+    """Reject known duplicates; source/item IDs do not imply unknown attempt links."""
+    identities = _identities(records)
+    if len(identities[0]) != len(records) or len(identities[1]) != len(records):
+        raise ValueError("Records must have unique record and response identities")
+    if len(identities[2]) != sum(r.provenance is not None for r in records):
+        raise ValueError("Records duplicate source provenance")
+
+
 def prepare_validation(development: tuple[DevelopmentRecord, ...],
                        validation: Iterable[ValidationRecord], config: ValidationConfig) -> dict[str, tuple[ValidationRecord, ...]]:
+    _validate_unique_identities(development)
     records = tuple(ValidationRecord.model_validate(r) for r in validation)
     if not records:
         raise ValueError("Validation collection cannot be empty")

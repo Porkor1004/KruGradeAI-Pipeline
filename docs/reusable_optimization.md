@@ -102,11 +102,16 @@ The fresh output directory receives:
   scored Development records, reflections, candidates, failures and review flags.
   **Private research output: it can contain answers and labels. Do not publish it.**
 - `summary.json`: path stop reasons, latest versions, configuration and call count.
+- `status.json`: execution state, last stage, call count and sanitized error type.
 
 The directory must not exist; input files and `data/raw/` cannot be output targets.
-This runner has no resume/retry. A partial directory from a process/setup failure
-is not proof of completion; inspect it and do not treat missing history as success.
-Agent failures/reviews follow existing orchestration behavior and appear in history.
+This runner has no resume/retry. Failed/interrupted runs retain partial artifacts
+and record `failed`/`interrupted` in `status.json`, without private exception text.
+Agent failures/reviews remain in history and produce `incomplete`; the CLI exits
+nonzero. A clean run records `completed`. Existing output paths remain rejected.
+Inspect partial files before choosing a new output path; do not silently replay
+possibly completed live calls. If storage fails, status writes may also fail, and
+an abrupt process termination may leave `running` or a partial status file.
 
 The conservative reservation is `iterations × (2 × Development records + rubric
 paths)`: at most one Grader and Reflector per record and one Refiner per path per
@@ -144,7 +149,9 @@ tests, contracts and frozen experiment results remain intact.
 
 ## Verification
 
-The full suite passes **399 tests** (386 existing plus 13 export/portability tests).
+The review suite passes **408 tests** (399 existing and nine new regression
+tests for failed-run status and duplicate identities). Targeted runner/Validation
+suites pass 38 tests. All inference is synthetic or mocked.
 The checked-in synthetic config was also run offline: four Development records,
 two rubric paths, ten mock-provider invocations, G1 proposals on both paths, and
 no Validation/Held-out access. No live calls or real-data optimization were run.

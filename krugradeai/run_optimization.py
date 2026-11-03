@@ -16,6 +16,7 @@ from krugradeai.providers import LLMProvider
 from krugradeai.reflector import LLMReflector
 from krugradeai.refiner import LLMRefiner
 from krugradeai.synthetic import build_mock_agents
+from krugradeai.validation import _validate_unique_identities
 
 
 class OptimizationConfig(Contract):
@@ -72,6 +73,7 @@ def prepare_run(config):
         raise ValueError("Use nonempty, uniquely identified Development records")
     if len({(r.question.id,r.response.id) for r in records}) != len(records):
         raise ValueError("Duplicate response identities")
+    _validate_unique_identities(records)
     definitions = {}
     for record in records:
         key = record.rubric.id
@@ -113,32 +115,59 @@ def run(config_path, *, live=False, dry_run=False):
     if destination.exists():
         raise FileExistsError("Use a fresh output directory; no overwrite/resume")
     output_directory(destination)
-    (destination/"configuration.json").write_text(config.model_dump_json(indent=2),encoding="utf-8")
-    if config.runtime == "synthetic_mock":
-        agents = build_mock_agents()
-    else:
-        settings = dict(model=config.model, executable=config.executable, timeout_seconds=config.timeout_seconds)
-        agents = (LLMGrader(CodexCLIProvider(**settings)),
-                  LLMReflector(CodexCLIProvider(**settings, output_model=ReflectorOutput)),
-                  LLMRefiner(CodexCLIProvider(**settings, output_model=AdaptationRules)))
     budget = _Budget(config.max_calls)
-    for agent in agents:
-        agent.provider = _BoundedProvider(agent.provider, budget)
-    protected = tuple(r.model_dump_json() for r in records)
-    loop = OptimizationLoop(grader=agents[0],reflector=agents[1],refiner=agents[2],
-                            max_iterations=config.max_iterations)
-    result = loop.run(records,config.initial_rules)
-    if protected != tuple(r.model_dump_json() for r in records) or Path(config.development).read_bytes() != content:
-        raise ValueError("Development inputs changed")
-    with (destination/"optimization.json").open("x",encoding="utf-8") as stream:
-        stream.write(result.model_dump_json(indent=2)+"\n")
-    summary = dict(**plan, provider_calls=budget.calls,
-                   paths=[dict(rubric_id=p.rubric_id,stop_reason=p.stop_reason,
-                               latest_version=p.final_version) for p in result.paths],
-                   selection="No Validation provided: latest proposal is not a best-guidelines claim")
-    with (destination/"summary.json").open("x",encoding="utf-8") as stream:
-        json.dump(summary,stream,indent=2)
-    return summary
+    stage = "configuration"
+
+    def record_status(status, error_type=None):
+        payload = dict(status=status, stage=stage, provider_calls=budget.calls)
+        if error_type is not None:
+            payload["error_type"] = error_type
+        (destination/"status.json").write_text(json.dumps(payload, indent=2)+"\n", encoding="utf-8")
+
+    try:
+        record_status("running")
+        (destination/"configuration.json").write_text(config.model_dump_json(indent=2),encoding="utf-8")
+        stage = "providers"
+        if config.runtime == "synthetic_mock":
+            agents = build_mock_agents()
+        else:
+            settings = dict(model=config.model, executable=config.executable, timeout_seconds=config.timeout_seconds)
+            agents = (LLMGrader(CodexCLIProvider(**settings)),
+                      LLMReflector(CodexCLIProvider(**settings, output_model=ReflectorOutput)),
+                      LLMRefiner(CodexCLIProvider(**settings, output_model=AdaptationRules)))
+        for agent in agents:
+            agent.provider = _BoundedProvider(agent.provider, budget)
+        protected = tuple(r.model_dump_json() for r in records)
+        loop = OptimizationLoop(grader=agents[0],reflector=agents[1],refiner=agents[2],
+                                max_iterations=config.max_iterations)
+        stage = "optimization"
+        result = loop.run(records,config.initial_rules)
+        stage = "integrity"
+        if protected != tuple(r.model_dump_json() for r in records) or Path(config.development).read_bytes() != content:
+            raise ValueError("Development inputs changed")
+        stage = "artifacts"
+        with (destination/"optimization.json").open("x",encoding="utf-8") as stream:
+            stream.write(result.model_dump_json(indent=2)+"\n")
+        status = "incomplete" if any(p.stop_reason in ("agent_failure", "human_review") for p in result.paths) else "completed"
+        summary = dict(**plan, provider_calls=budget.calls, status=status,
+                       paths=[dict(rubric_id=p.rubric_id,stop_reason=p.stop_reason,
+                                   latest_version=p.final_version) for p in result.paths],
+                       selection="No Validation provided: latest proposal is not a best-guidelines claim")
+        with (destination/"summary.json").open("x",encoding="utf-8") as stream:
+            json.dump(summary,stream,indent=2)
+        stage = "finished"
+        record_status(status)
+        return summary
+    except (Exception, KeyboardInterrupt) as error:
+        # Keep partial artifacts and the original exception; never persist its
+        # message, which may contain prompts, answers or provider diagnostics.
+        try:
+            record_status("interrupted" if isinstance(error, KeyboardInterrupt) else "failed",
+                          type(error).__name__)
+        except OSError:
+            pass  # A storage failure may prevent even the status from being saved.
+        raise
+
 
 
 def main(argv=None):
@@ -153,7 +182,8 @@ def main(argv=None):
     except Exception as error:
         parser.exit(1,f"Optimization refused/incomplete ({type(error).__name__}); no private input printed, no automatic retry.\n")
     print(json.dumps(result,indent=2))
+    return 1 if result.get("status") == "incomplete" else 0
 
 
 if __name__=="__main__":
-    main()
+    raise SystemExit(main())
