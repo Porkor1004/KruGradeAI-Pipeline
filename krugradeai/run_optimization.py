@@ -11,18 +11,24 @@ from krugradeai.codex_provider import CodexCLIProvider
 from krugradeai.grader import LLMGrader
 from krugradeai.models import AdaptationRules, Contract, ReflectorOutput, Text
 from krugradeai.optimization import OptimizationLoop
-from krugradeai.optimization_models import DevelopmentRecord
+from krugradeai.optimization_models import DevelopmentRecord, ValidationRecord, ValidationConfig
 from krugradeai.providers import LLMProvider
 from krugradeai.reflector import LLMReflector
 from krugradeai.refiner import LLMRefiner
 from krugradeai.synthetic import build_mock_agents
-from krugradeai.validation import _validate_unique_identities
+from krugradeai.validation import _validate_unique_identities, prepare_validation
+from krugradeai.prompts import GRADING_PROMPT
+from krugradeai.prompt_transport import PromptProvider
+from krugradeai.models import GraderInput, StudentResponse
 
 
 class OptimizationConfig(Contract):
     development: Text
     output_directory: Text
     runtime: Literal["synthetic_mock", "codex_cli"] = "synthetic_mock"
+    prompt_file: Text | None = None
+    validation: Text | None = None
+    validation_config: ValidationConfig = Field(default_factory=ValidationConfig)
     model: Text | None = None
     executable: Text | None = None
     timeout_seconds: float = Field(default=120, gt=0, allow_inf_nan=False)
@@ -58,7 +64,9 @@ def load_config(path):
     config = OptimizationConfig.model_validate_json(path.read_bytes())
     # Input/output paths resolve relative to the config, never a developer's CWD.
     data = config.model_dump()
-    for field in ("development", "output_directory"):
+    for field in ("development", "output_directory", "validation", "prompt_file"):
+        if data[field] is None:
+            continue
         data[field] = str((path.parent/data[field]).resolve())
     if config.executable and ("/" in config.executable or "\\" in config.executable):
         data["executable"] = str((path.parent/config.executable).resolve())
@@ -102,16 +110,32 @@ def run(config_path, *, live=False, dry_run=False):
     if config.runtime == "codex_cli" and not (live or dry_run):
         raise ValueError("Codex execution requires explicit --live")
     records, required, content = prepare_run(config)
+    validation_records, validation_content = None, None
+    if config.validation:
+        validation_content = Path(config.validation).read_bytes()
+        validation_records = tuple(ValidationRecord.model_validate_json(line)
+            for line in validation_content.decode("utf-8").splitlines() if line.strip())
+        prepare_validation(records, validation_records, config.validation_config)
+        required += (config.max_iterations + 1) * len(validation_records)
+        if config.max_calls < required:
+            raise ValueError("Budget must also reserve baseline and candidate Validation calls")
+    instructions = Path(config.prompt_file).read_text(encoding="utf-8") if config.prompt_file else GRADING_PROMPT
+    if not instructions.strip() or "\nINPUT_JSON\n" in instructions:
+        raise ValueError("Supply instruction text without an embedded input block")
     plan = dict(records=len(records), rubric_paths=len({r.rubric.id for r in records}),
                 reserved_maximum_calls=required, configured_max_calls=config.max_calls,
                 max_iterations=config.max_iterations, runtime=config.runtime,
-                validation_loaded=False, heldout_loaded=False)
+                validation_loaded=validation_records is not None, heldout_loaded=False)
     if dry_run:
         return plan
     destination = Path(config.output_directory)
     # Never write into source inputs, datasets or prior outputs.
     if destination == Path(config.development) or destination in Path(config.development).parents:
         raise ValueError("Output must not contain the input dataset")
+    if config.prompt_file and (destination == Path(config.prompt_file) or destination in Path(config.prompt_file).parents):
+        raise ValueError("Output must not contain the prompt file")
+    if config.validation and (destination == Path(config.validation) or destination in Path(config.validation).parents):
+        raise ValueError("Output must not contain Validation inputs")
     if destination.exists():
         raise FileExistsError("Use a fresh output directory; no overwrite/resume")
     output_directory(destination)
@@ -137,22 +161,49 @@ def run(config_path, *, live=False, dry_run=False):
                       LLMRefiner(CodexCLIProvider(**settings, output_model=AdaptationRules)))
         for agent in agents:
             agent.provider = _BoundedProvider(agent.provider, budget)
+        if config.prompt_file:
+            agents[0].provider = PromptProvider(agents[0].provider, instructions)
         protected = tuple(r.model_dump_json() for r in records)
         loop = OptimizationLoop(grader=agents[0],reflector=agents[1],refiner=agents[2],
-                                max_iterations=config.max_iterations)
+                                max_iterations=config.max_iterations, validation_config=config.validation_config)
         stage = "optimization"
-        result = loop.run(records,config.initial_rules)
+        result = loop.run(records,config.initial_rules, validation_records=validation_records)
         stage = "integrity"
         if protected != tuple(r.model_dump_json() for r in records) or Path(config.development).read_bytes() != content:
             raise ValueError("Development inputs changed")
+        if config.validation and Path(config.validation).read_bytes() != validation_content:
+            raise ValueError("Validation inputs changed")
         stage = "artifacts"
+        # Export only selected rules when Validation exists; otherwise mark proposals.
+        exports = []
+        for index, path in enumerate(result.paths, 1):
+            selected = path.validation
+            version = selected.best_version if selected else path.final_version
+            if version is None:
+                continue
+            rules = selected.best_rules if selected else path.rule_versions[version].rules
+            record = next(r for r in records if r.rubric.id == path.rubric_id)
+            definition = dict(question=record.question.model_dump(mode="json"),
+                rubric=record.rubric.model_dump(mode="json"), adaptation_rules=rules.model_dump(mode="json"))
+            (destination / f"prompt-{index}.json").write_text(json.dumps(definition, indent=2)+"\n", encoding="utf-8")
+            response = StudentResponse(id="REPLACE_WITH_RESPONSE_ID", question_id=record.question.id,
+                                       text="REPLACE_WITH_ORIGINAL_STUDENT_ANSWER")
+            template = instructions + "\nINPUT_JSON\n" + GraderInput(
+                question=record.question, rubric=record.rubric, response=response,
+                adaptation_rules=rules).model_dump_json()
+            (destination / f"prompt-{index}.grader.txt").write_text(template, encoding="utf-8")
+            exports.append(dict(rubric_id=path.rubric_id, version=version,
+                                validated=selected is not None, definition=f"prompt-{index}.json"))
+        (destination / "grader-instructions.txt").write_text(instructions, encoding="utf-8")
         with (destination/"optimization.json").open("x",encoding="utf-8") as stream:
             stream.write(result.model_dump_json(indent=2)+"\n")
-        status = "incomplete" if any(p.stop_reason in ("agent_failure", "human_review") for p in result.paths) else "completed"
+        status = "incomplete" if any(p.stop_reason in ("agent_failure", "human_review") or
+            (p.validation is not None and p.validation.best_version is None) for p in result.paths) else "completed"
         summary = dict(**plan, provider_calls=budget.calls, status=status,
                        paths=[dict(rubric_id=p.rubric_id,stop_reason=p.stop_reason,
                                    latest_version=p.final_version) for p in result.paths],
-                       selection="No Validation provided: latest proposal is not a best-guidelines claim")
+                       prompt_exports=exports,
+                       selection="Validation-selected rules" if validation_records is not None else "No Validation provided: latest proposal is not a best-guidelines claim")
         with (destination/"summary.json").open("x",encoding="utf-8") as stream:
             json.dump(summary,stream,indent=2)
         stage = "finished"

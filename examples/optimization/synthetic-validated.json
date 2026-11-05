@@ -1,0 +1,11 @@
+{
+  "development": "synthetic-development.jsonl",
+  "output_directory": "../../artifacts/validated-optimization-example-001",
+  "runtime": "synthetic_mock",
+  "max_iterations": 1,
+  "max_calls": 18,
+  "initial_rules": {
+    "rules": []
+  },
+  "validation": "synthetic-validation.jsonl"
+}

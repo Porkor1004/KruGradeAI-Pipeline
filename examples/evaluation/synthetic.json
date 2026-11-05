@@ -1,0 +1,8 @@
+{
+  "dataset": "synthetic.jsonl",
+  "rubric_file": "rubric.json",
+  "prompt_file": "grader.txt",
+  "mock_responses": "responses.json",
+  "runtime": "mock",
+  "output_directory": "../../artifacts/independent-evaluation-example-001"
+}

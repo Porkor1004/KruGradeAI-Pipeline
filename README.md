@@ -19,6 +19,122 @@ Frozen Pydantic models and Decimal scores enforce criterion coverage, bounds and
 total consistency. Each rubric has its own optimization path. See the
 [architecture](docs/architecture.md) and the [agent contracts](docs/grader.md).
 
+## Two independent pipelines
+
+Both workflows use the existing Grader, contracts, provider, Decimal metrics and
+score-only evaluation kernel. Run from the repository root after installation.
+Installed CLI aliases are `krugradeai-optimize` and `krugradeai-evaluate`.
+
+### Agent Optimization Pipeline
+
+```powershell
+python -m krugradeai.run_optimization --config examples/optimization/synthetic.json
+python -m krugradeai.run_optimization --config examples/optimization/synthetic-validated.json
+```
+
+The first command preserves Development-only behavior. The second supplies separate
+Validation data to select G0 or a generated candidate with the existing MAE,
+coverage, tie-breaking, patience and stopping policies. Validation labels never
+reach Reflector or Refiner. The Grader → Reflector → Refiner methodology is unchanged.
+
+Inputs: JSON config with `development` (DevelopmentRecord JSONL), optional
+`validation` (ValidationRecord JSONL), `validation_config`, `initial_rules`, optional
+`prompt_file` (Grader instruction prefix), model/executable/timeout, iteration and
+shared call-budget settings, and `output_directory`. Paths resolve relative to the
+config. Reserve the existing Development call bound plus
+`(max_iterations + 1) * validation_record_count` calls when supplying Validation.
+
+Outputs: `configuration.json`, `status.json`, `optimization.json`, `summary.json`,
+`grader-instructions.txt`, and per-scope `prompt-N.json` / `prompt-N.grader.txt`.
+The JSON definition contains question, rubric and adaptation rules. The text has
+an explicit response placeholder. With Validation, exports use the selected version,
+which may be G0. Without Validation they are proposals marked `validated: false`.
+No valid selection means no selected export for that scope and an incomplete run.
+Exports contain no student answers or reference scores.
+
+### Independent Evaluation Pipeline
+
+```powershell
+python -m krugradeai.run_evaluation --config examples/evaluation/synthetic.json
+python -m krugradeai.run_evaluation --config examples/evaluation/synthetic.json --dry-run
+```
+
+Evaluation constructs only the existing Grader. It neither imports nor starts the
+optimization loop, Reflector or Refiner, and requires no optimization report or
+frozen selection. The example is entirely synthetic, including the label origins.
+
+The JSON config specifies these separate inputs:
+
+- `prompt_file`: UTF-8 instruction prefix. The runner appends `\nINPUT_JSON\n`
+  and validated Grader input. Include the output JSON contract, as in the example
+  `grader.txt`. Do not include a response placeholder or embedded input block.
+- `rubric_file`: one teacher Rubric JSON with criterion IDs, descriptions, maxima
+  and total. A run evaluates one rubric scope.
+- `dataset`: JSONL with `id`, `question`, `response`, `ta_output`, `provenance`, and
+  optional `split: "evaluation"`. Rubric is supplied separately. References accept
+  the existing full or total-only schema. Provenance requires `source`, `item_id`
+  and explicit `label_origin`: `human_derived` or `ai_derived`.
+- `adaptation_rules`: optional existing rules JSON in the config. To evaluate an
+  optimization export, use its rubric and adaptation rules with exported
+  `grader-instructions.txt`. The complete `.grader.txt` is a manual assembly template,
+  not an instruction-prefix input.
+- `runtime`, `model`, `executable`, `timeout_seconds`, and `output_directory`.
+  `runtime: "mock"` requires `mock_responses`, a JSON array with one scripted response
+  per row. Mock responses test software behavior; they are not an offline grader.
+
+Outputs: `report.json` and `status.json`. The report contains per-row outcomes and
+failures/reviews, MAE, normalized MAE (mean per-record absolute error divided by
+rubric maximum), Exact Match and Coverage. Missing or invalid grades reduce Coverage
+and never become zero scores. Separate human-derived and AI-derived metrics include
+empty groups. AI metrics measure pseudo-label agreement, not human grading accuracy;
+mixed metrics are descriptive only.
+
+Reports retain input and source-code SHA-256 hashes, resolved config, Python version,
+requested model and provider call count. Keep the exact source inputs for replay;
+hashes cannot recreate them. Mock runs are deterministic. Live LLM output is not
+guaranteed deterministic; effective model identity remains unknown without evidence.
+
+### Execution, compatibility and limitations
+
+Both CLIs support `--dry-run`. Configured `codex_cli` execution requires an explicit
+model and `--live`. No model was added and verification uses mocks only. Codex CLI
+task-text instructions are **not necessarily native system-role messages**: the
+existing provider transports policy and task text through CLI stdin.
+
+Use fresh output directories; outputs are never overwritten or resumed. Reports
+can contain private answers and labels. Keep outputs under Git-ignored `artifacts/`,
+source data under `data/` or `private-data/`, and private configs under `local-config/`.
+Only reviewed synthetic fixtures belong in `examples/`. Historical reports, frozen
+guidelines and original rubric files remain preserved. Existing `run_optimization`,
+`optimize_real`, `final_evaluation`, `prompt_export` and other module commands remain
+available. The historical freeze/final-evaluation workflow retains its safeguards.
+
+New datasets do **not** automatically produce validated final prompts. Users must
+prepare schemas, immutable teacher rubrics, trustworthy labels and independent,
+leakage-free partitions. Identity checks cannot discover unknown semantic or attempt
+relationships. Mock optimization accepts only shipped Development fixtures. Real
+optimization needs explicit live execution, sufficient coverage and a valid
+selection; Validation selection alone is not held-out evidence or human approval.
+Independent evaluation reports performance and never selects, refines or certifies
+a prompt.
+
+```text
+krugradeai/
+  run_optimization.py   # three-agent CLI, optional Validation and prompt export
+  optimization.py       # unchanged loop and stopping policies
+  run_evaluation.py     # independent score-only CLI
+  evaluation.py         # external inputs, report and label-origin metrics
+  prompt_transport.py   # shared external instruction-prefix adapter
+  grader.py / models.py / providers.py / metrics.py / validation.py  # shared
+examples/
+  optimization/         # Development-only and validated synthetic workflows
+  evaluation/           # prompt, rubric, labeled data and scripted outputs
+```
+
+Run `python -m unittest discover -s tests`. Regression tests execute both CLIs in
+subprocesses and check label isolation, failed-grade Coverage, Validation exports
+and that importing evaluation does not load optimization modules.
+
 ## Install
 
 Requires Python 3.11+. From the repository root, on Windows:
