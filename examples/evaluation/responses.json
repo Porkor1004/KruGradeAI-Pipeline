@@ -1,0 +1,34 @@
+[
+  {
+    "criterion_scores": [
+      {
+        "criterion_id": "method",
+        "score": "0.5",
+        "rationale": "Synthetic scripted assessment of transformation evidence."
+      },
+      {
+        "criterion_id": "result",
+        "score": "1",
+        "rationale": "Synthetic scripted assessment of stated final value."
+      }
+    ],
+    "total_score": "1.5",
+    "overall_feedback": "Synthetic scripted feedback, not a real grading assessment."
+  },
+  {
+    "criterion_scores": [
+      {
+        "criterion_id": "method",
+        "score": "0",
+        "rationale": "Synthetic scripted assessment of transformation evidence."
+      },
+      {
+        "criterion_id": "result",
+        "score": "0",
+        "rationale": "Synthetic scripted assessment of stated final value."
+      }
+    ],
+    "total_score": "0",
+    "overall_feedback": "Synthetic scripted feedback, not a real grading assessment."
+  }
+]
