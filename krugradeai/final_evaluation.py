@@ -279,7 +279,7 @@ def evaluate_final(*, live=False, frozen_path=DEFAULT_FROZEN, output_root="artif
                 raise ValueError("Held-out rubric differs from frozen immutable rubric")
             if record.provenance.label_origin != declared[record.id]["label_origin"] or record.question.id != declared[record.id]["question_id"]:
                 raise ValueError("Held-out scope/provenance differs from manifest")
-        provider = _FinalProvider(CodexCLIProvider(model=model, timeout_seconds=timeout),
+        provider = _FinalProvider(CodexCLIProvider(model=model, role="heldout_grader", invocation_log=destination/"provider-invocations.jsonl", timeout_seconds=timeout),
                                   max_calls, destination/"provider_calls.jsonl")
         grader = LLMGrader(provider)
         paths, baseline_rows, selected_rows, summaries = [], [], [], []
@@ -340,7 +340,7 @@ def main(argv=None):
     parser.add_argument("--optimization-report", default=DEFAULT_REPORT)
     parser.add_argument("--data-directory", default="artifacts/real-mixed-v1")
     parser.add_argument("--frozen", default=DEFAULT_FROZEN)
-    parser.add_argument("--model", help="Required for live evaluation; pinned for both baseline and selected passes")
+    parser.add_argument("--model", default="gpt-6-luna", help="Required for live evaluation; pinned for both baseline and selected passes")
     parser.add_argument("--model-verification", help="Optional safe historical audit JSON, used only when preparing")
     parser.add_argument("--run-id", default="heldout-full-001")
     parser.add_argument("--max-calls", type=int, default=29)

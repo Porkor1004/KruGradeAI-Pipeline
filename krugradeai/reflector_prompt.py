@@ -117,7 +117,8 @@ def build_reflector_prompt(request: ReflectorInput) -> str:
     grade = request.record.grader_output
     difference = grade.total_score - label.total_score
     ai = {c.criterion_id: c.score for c in grade.criterion_scores}
-    context = dict(total_only=not label.criterion_scores,
+    context = dict(reference_total_score_origin=request.reference_total_score_origin,
+                   total_only=not label.criterion_scores,
                    overall_score_difference=str(difference),
                    direction="overgrading" if difference > 0 else "undergrading" if difference < 0 else "agreement",
                    criterion_differences=[dict(criterion_id=c.criterion_id, difference=str(ai[c.criterion_id] - c.score))

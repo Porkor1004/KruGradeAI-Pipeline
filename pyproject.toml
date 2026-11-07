@@ -9,6 +9,10 @@ description = "Dataset-independent grading optimization contracts"
 requires-python = ">=3.11"
 dependencies = ["pydantic>=2.0,<3.0"]
 
+[project.scripts]
+krugradeai-optimize = "krugradeai.run_optimization:main"
+krugradeai-evaluate = "krugradeai.run_evaluation:main"
+
 [project.optional-dependencies]
 data = ["openpyxl>=3.1,<4"]
 

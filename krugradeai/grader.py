@@ -27,6 +27,15 @@ class _ScoredResponse(GraderOutput):
     overall_feedback: Text
 
 
+class AIAdjudicatedGrade(GraderOutput):
+    """Internally issued provisional grade, never accepted from the direct Grader."""
+
+
+class CLIGraderResponse(Contract):
+    """Single object root required by CLI structured output, with either valid outcome."""
+    result: _ScoredResponse | _ReviewRequest
+
+
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     result = {}
     for key, value in pairs:

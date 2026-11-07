@@ -3,7 +3,8 @@ from collections.abc import Iterable
 from krugradeai.execution import _invoke, _failure
 
 from krugradeai.agents import Grader, Reflector, Refiner
-from krugradeai.grader import HumanReviewRequired
+from krugradeai.grader import AIAdjudicatedGrade, HumanReviewRequired
+from krugradeai.model_routing import ModelRoutingError
 from krugradeai.models import (
     AdaptationRule, AdaptationRules, GraderInput, GraderOutput,
     GradingRecord, ReflectorInput, ReflectorOutput, RefinerInput,
@@ -48,10 +49,13 @@ class OptimizationLoop:
 
     def __init__(self, *, grader: Grader, reflector: Reflector, refiner: Refiner,
                  max_iterations: int = 3, validation_config: ValidationConfig | None = None,
-                 review_policy: str = "stop_path") -> None:
+                 validation_grader: Grader | None = None,
+                 fail_fast=False, validation_observer=None, review_policy: str = "stop_path") -> None:
         if type(max_iterations) is not int or max_iterations < 0:
             raise ValueError("max_iterations must be a nonnegative integer")
         self.grader, self.reflector, self.refiner = grader, reflector, refiner
+        self.fail_fast, self.validation_observer = fail_fast, validation_observer
+        self.validation_grader = validation_grader or grader
         self.max_iterations = max_iterations
         if review_policy not in ("stop_path", "exclude_reviewed_records"):
             raise ValueError("Unknown review policy")
@@ -86,7 +90,7 @@ class OptimizationLoop:
     def _run_path(self, examples: list[DevelopmentRecord], initial: AdaptationRules,
                   validation_records: tuple[ValidationRecord, ...] | None = None) -> OptimizationPath:
         versions = [RuleVersion(version=0, parent_version=None, created_iteration=0, rules=initial)]
-        validation = ValidationTracker(self.grader, validation_records, self.validation_config) if validation_records is not None else None
+        validation = ValidationTracker(self.validation_grader, validation_records, self.validation_config, fail_fast=self.fail_fast, observer=self.validation_observer) if validation_records is not None else None
         if validation is not None:
             validation.observe(0, initial)
         history = []
@@ -96,20 +100,29 @@ class OptimizationLoop:
             outcomes, failures, reviews, reflections = [], [], [], []
             for example in examples:
                 grading, reflection, discrepancy = None, None, None
-                record_review = False
+                record_review = assisted = False
                 request = GraderInput(question=example.question, rubric=example.rubric,
                                       response=example.response, adaptation_rules=active.rules)
                 try:
-                    output = GraderOutput.model_validate(_invoke(self.grader.grade, request))
+                    prediction = _invoke(self.grader.grade, request)
+                    assisted = isinstance(prediction, AIAdjudicatedGrade)
+                    output = GraderOutput.model_validate(prediction)
                     grading = GradingRecord(grader_input=request, grader_output=output)
                     discrepancy = _has_discrepancy(grading, example)
                 except HumanReviewRequired as error:
+                    if self.fail_fast:
+                        raise
                     record_review = True
                     reviews.append(HumanReviewFlag(stage="grader", record_id=example.id, reasons=(error.reason,)))
+                except ModelRoutingError:
+                    raise
                 except Exception as error:
+                    if self.fail_fast:
+                        raise
                     failures.append(_failure("grader", example.id, error))
                 if grading is not None and discrepancy:
-                    reflection_request = ReflectorInput(record=grading, ta_output=example.ta_output)
+                    reflection_request = ReflectorInput(record=grading, ta_output=example.ta_output,
+                        reference_total_score_origin=(example.provenance.score_origin if example.provenance else None) or "unknown")
                     try:
                         output = ReflectorOutput.model_validate(_invoke(self.reflector.reflect, reflection_request))
                         _validate_reflection(output, reflection_request)
@@ -117,14 +130,22 @@ class OptimizationLoop:
                         if not output.human_review_required or self.review_policy == "stop_path":
                             reflections.append(output)
                         if output.human_review_required:
+                            if self.fail_fast:
+                                raise HumanReviewRequired("Unresolved Development reflection: " + "; ".join(output.review_reasons))
                             record_review = True
                             reviews.append(HumanReviewFlag(stage="reflector", record_id=example.id, reasons=output.review_reasons))
                     except HumanReviewRequired as error:
+                        if self.fail_fast:
+                            raise
                         record_review = True
                         reviews.append(HumanReviewFlag(stage="reflector", record_id=example.id, reasons=(error.reason,)))
+                    except ModelRoutingError:
+                        raise
                     except Exception as error:
+                        if self.fail_fast:
+                            raise
                         failures.append(_failure("reflector", example.id, error))
-                outcomes.append(RecordHistory(record_id=example.id, grading=grading, discrepancy=discrepancy,
+                outcomes.append(RecordHistory(record_id=example.id, grading=grading, ai_adjudicated=assisted, discrepancy=discrepancy,
                                               reflection=reflection, human_review_required=record_review))
             proposed, candidate_version, terminal = None, None, None
             if failures:
@@ -148,9 +169,15 @@ class OptimizationLoop:
                         versions.append(RuleVersion(version=candidate_version, parent_version=active.version,
                                                     created_iteration=iteration, rules=proposed))
                 except HumanReviewRequired as error:
+                    if self.fail_fast:
+                        raise
                     reviews.append(HumanReviewFlag(stage="refiner", reasons=(error.reason,)))
                     terminal = "human_review"
+                except ModelRoutingError:
+                    raise
                 except Exception as error:
+                    if self.fail_fast:
+                        raise
                     failures.append(_failure("refiner", None, error))
                     terminal = "agent_failure"
             if validation is not None and candidate_version is not None:

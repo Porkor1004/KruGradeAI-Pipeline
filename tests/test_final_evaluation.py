@@ -91,7 +91,8 @@ class FinalEvaluationTests(unittest.TestCase):
         with patch("krugradeai.final_evaluation.CodexCLIProvider", return_value=provider) as build:
             result = evaluate_final(live=True, frozen_path=self.frozen, output_root=self.output,
                 model="synthetic-model", **kwargs)
-        build.assert_called_once_with(model="synthetic-model", timeout_seconds=120.0)
+        self.assertEqual(build.call_args.kwargs["role"], "heldout_grader")
+        self.assertEqual(build.call_args.kwargs["model"], "synthetic-model")
         return result, provider
 
     def test_prepare_reads_report_manifest_only_and_freezes_exact_selection(self):

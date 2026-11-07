@@ -19,6 +19,121 @@ Frozen Pydantic models and Decimal scores enforce criterion coverage, bounds and
 total consistency. Each rubric has its own optimization path. See the
 [architecture](docs/architecture.md) and the [agent contracts](docs/grader.md).
 
+## Two independent pipelines
+
+Both workflows use the existing Grader, contracts, provider, Decimal metrics and
+score-only evaluation kernel. Run from the repository root after installation.
+Installed CLI aliases are `krugradeai-optimize` and `krugradeai-evaluate`.
+
+### Agent Optimization Pipeline
+
+```powershell
+python -m krugradeai.run_optimization --config examples/optimization/synthetic.json
+python -m krugradeai.run_optimization --config examples/optimization/synthetic-validated.json
+```
+
+The first command preserves Development-only behavior. The second supplies separate
+Validation data to select G0 or a generated candidate with the existing MAE,
+coverage, tie-breaking, patience and stopping policies. Validation labels never
+reach Reflector or Refiner. The Grader → Reflector → Refiner methodology is unchanged.
+
+Inputs: JSON config with `development` (DevelopmentRecord JSONL), optional
+`validation` (ValidationRecord JSONL), `validation_config`, `initial_rules`, optional
+`prompt_file` (Grader instruction prefix), model/executable/timeout, iteration and
+shared call-budget settings, and `output_directory`. Paths resolve relative to the
+config. Reserve the existing Development call bound plus
+`(max_iterations + 1) * validation_record_count` calls when supplying Validation.
+
+Outputs: `configuration.json`, `status.json`, `optimization.json`, `summary.json`,
+`grader-instructions.txt`, and per-scope `prompt-N.json` / `prompt-N.grader.txt`.
+The JSON definition contains question, rubric and adaptation rules. The text has
+an explicit response placeholder. With Validation, exports use the selected version,
+which may be G0. Without Validation they are proposals marked `validated: false`.
+No valid selection means no selected export for that scope and an incomplete run.
+Exports contain no student answers or reference scores.
+
+### Independent Evaluation Pipeline
+
+```powershell
+python -m krugradeai.run_evaluation --config examples/evaluation/synthetic.json
+python -m krugradeai.run_evaluation --config examples/evaluation/synthetic.json --dry-run
+```
+
+Evaluation constructs only the existing Grader. It neither imports nor starts the
+optimization loop, Reflector or Refiner, and requires no optimization report or
+frozen selection. The example is entirely synthetic, including the label origins.
+
+The JSON config specifies these separate inputs:
+
+- `prompt_file`: UTF-8 instruction prefix. The runner appends `\nINPUT_JSON\n`
+  and validated Grader input. Include the output JSON contract, as in the example
+  `grader.txt`. Do not include a response placeholder or embedded input block.
+- `rubric_file`: one teacher Rubric JSON with criterion IDs, descriptions, maxima
+  and total. A run evaluates one rubric scope.
+- `dataset`: JSONL with `id`, `question`, `response`, `ta_output`, `provenance`, and
+  optional `split: "evaluation"`. Rubric is supplied separately. References accept
+  the existing full or total-only schema. Provenance requires `source`, `item_id`
+  and explicit `label_origin`: `human_derived` or `ai_derived`.
+- `adaptation_rules`: optional existing rules JSON in the config. To evaluate an
+  optimization export, use its rubric and adaptation rules with exported
+  `grader-instructions.txt`. The complete `.grader.txt` is a manual assembly template,
+  not an instruction-prefix input.
+- `runtime`, `model`, `executable`, `timeout_seconds`, and `output_directory`.
+  `runtime: "mock"` requires `mock_responses`, a JSON array with one scripted response
+  per row. Mock responses test software behavior; they are not an offline grader.
+
+Outputs: `report.json` and `status.json`. The report contains per-row outcomes and
+failures/reviews, MAE, normalized MAE (mean per-record absolute error divided by
+rubric maximum), Exact Match and Coverage. Missing or invalid grades reduce Coverage
+and never become zero scores. Separate human-derived and AI-derived metrics include
+empty groups. AI metrics measure pseudo-label agreement, not human grading accuracy;
+mixed metrics are descriptive only.
+
+Reports retain input and source-code SHA-256 hashes, resolved config, Python version,
+requested model and provider call count. Keep the exact source inputs for replay;
+hashes cannot recreate them. Mock runs are deterministic. Live LLM output is not
+guaranteed deterministic; effective model identity remains unknown without evidence.
+
+### Execution, compatibility and limitations
+
+Both CLIs support `--dry-run`. Configured `codex_cli` execution uses explicit per-role model IDs and requires `--live`. No model was added and verification uses mocks only. Codex CLI
+task-text instructions are **not necessarily native system-role messages**: the
+existing provider transports policy and task text through CLI stdin.
+
+Use fresh output directories; outputs are never overwritten or resumed. Reports
+can contain private answers and labels. Keep outputs under Git-ignored `artifacts/`,
+source data under `data/` or `private-data/`, and private configs under `local-config/`.
+Only reviewed synthetic fixtures belong in `examples/`. Historical reports, frozen
+guidelines and original rubric files remain preserved. Existing `run_optimization`,
+`optimize_real`, `final_evaluation`, `prompt_export` and other module commands remain
+available. The historical freeze/final-evaluation workflow retains its safeguards.
+
+New datasets do **not** automatically produce validated final prompts. Users must
+prepare schemas, immutable teacher rubrics, trustworthy labels and independent,
+leakage-free partitions. Identity checks cannot discover unknown semantic or attempt
+relationships. Mock optimization accepts only shipped Development fixtures. Real
+optimization needs explicit live execution, sufficient coverage and a valid
+selection; Validation selection alone is not held-out evidence or human approval.
+Independent evaluation reports performance and never selects, refines or certifies
+a prompt.
+
+```text
+krugradeai/
+  run_optimization.py   # three-agent CLI, optional Validation and prompt export
+  optimization.py       # unchanged loop and stopping policies
+  run_evaluation.py     # independent score-only CLI
+  evaluation.py         # external inputs, report and label-origin metrics
+  prompt_transport.py   # shared external instruction-prefix adapter
+  grader.py / models.py / providers.py / metrics.py / validation.py  # shared
+examples/
+  optimization/         # Development-only and validated synthetic workflows
+  evaluation/           # prompt, rubric, labeled data and scripted outputs
+```
+
+Run `python -m unittest discover -s tests`. Regression tests execute both CLIs in
+subprocesses and check label isolation, failed-grade Coverage, Validation exports
+and that importing evaluation does not load optimization modules.
+
 ## Install
 
 Requires Python 3.11+. From the repository root, on Windows:
@@ -110,6 +225,14 @@ Held-out data, select best guidelines or enable AI adjudication. The latest
 candidate is a proposal, not evidence of improvement.
 
 ## Data and rubrics
+
+For a complete private source inventory, use the opt-in exhaustive workflow in
+[full dataset preparation](docs/full_dataset_preparation.md). It retains every
+physical source row and its disposition, keeps unknown label provenance separate,
+and exercises both independent pipelines offline without the historical selection
+policy. The historical `real_data` preparation remains unchanged for replay.
+Use the documented `corrected_dataset` / `corrected_audit` workflow for the
+owner-clarified TA-score and OCR-review provenance and the three-way split.
 
 The portable runner reads UTF-8 JSONL with one `DevelopmentRecord` per line.
 Each record contains `id`, `split: "development"`, `question`, `rubric`, `response`,
@@ -238,3 +361,21 @@ Small grouped samples, uncertain transcription/label provenance and Validation
 reuse limit conclusions about generalization. AI-label agreement is not human
 grading accuracy. The original legacy system prompt is still missing, so the
 baseline-comparison module has no verified real legacy-prompt result.
+
+## Live model routing
+
+The `models` object in the synthetic configs specifies all six routes. Grader, Validation, independent evaluation and held-out Test default to `gpt-6-luna`. Reflector and Refiner default to `gpt-6-astra`. Set evaluation `role` to `heldout_grader` for Test. A legacy `model` value overrides only the Grader for that pipeline. Each live invocation passes an explicit CLI model. The private `provider-invocations.jsonl` records role, requested ID, reported effective ID and invocation status. A successful Codex CLI turn records verification_status=requested_only. A missing effective model is recorded as null. The adapter checks turn completion, CLI exit status, reported routing conflicts and the output contract before returning a result. Exact CLI arguments are logged privately; prompts and credentials travel outside the argument list.
+
+### Exploratory AI-assisted review
+
+Set `review_policy` to `ai_assisted_pilot` in a Codex CLI optimization config to enable this experiment. The default is `strict`. A Grader review can trigger one independent Astra assessment of the answer, rubric, rules and review reason. A provisional score is labeled `ai_adjudicated` in the private review log and grade feedback. Abstention preserves the unresolved review. This applies to both Development and Validation grading. Any resulting Validation metric measures the assisted grading process.
+
+A Development Reflector review can trigger one Astra diagnostic pass with the original findings and labeled Development evidence. The existing reflector checks must accept the quotes, arithmetic and criterion evidence before a supported adaptation can reach Refiner. The pilot follows the existing stop-path policy on unresolved Development reviews; an unresolved Validation grade reduces coverage. Each extra invocation charges the shared call budget. The private `assisted-reviews.jsonl` records the original decision and adjudication outcome. Strict and assisted experiment results should be identified by policy when reporting them.
+
+### Standard experiment execution and reporting
+
+The live optimizer claims a fresh directory under Git-ignored `artifacts/` and assigns an experiment ID. Dry-run the exact config first. Preflight reserves all ordinary calls, optional malformed-output retries, and one possible assessment or diagnostic per eligible review. Demand above `max_calls` rejects both dry-run and live execution. All agents share that cap. For subscription runs both CLI retry settings are fixed at zero. Set `retry_malformed_output: false` to disable the separate application retry. An unresolved review, invalid agent output after any permitted retry, provider error, or budget failure stops live execution. Inspect the fresh directory before starting another experiment.
+
+`validation-history.jsonl` checkpoints each evaluated scope/version. The final `summary.json` includes generation history, patience and selected versions. Each breakdown reports the fixed population, label origins, direct-only and adjudicated-only coverage and MAE, and combined-policy MAE. MAE denominators count successful predictions in the corresponding cohort. Coverage uses the whole declared population. A direct-only MAE on a changing subset cannot substitute for selection MAE. Compare versions under the same review policy on the same original-TA Validation records, requiring complete coverage. The earliest minimum wins. Report any differences in adjudication incidence even when coverage is equal.
+
+Use three iterations, patience two and minimum delta zero for the full experiment. Candidates derive from the latest rules. Export the selected best for covered scopes. Development-only proposals have no selected Validation version; use G0 for formal Test until compatible independent Validation evidence is available. Independent evaluation reports the same prediction breakdown and performs no selection. Supply `guideline_version` when evaluating a known version.

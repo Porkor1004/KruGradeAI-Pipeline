@@ -1,0 +1,16 @@
+{
+  "id": "synthetic-linear-1",
+  "criteria": [
+    {
+      "id": "method",
+      "description": "Credit valid equivalent transformations. Partial credit is allowed for incomplete valid reasoning.",
+      "max_score": "1"
+    },
+    {
+      "id": "result",
+      "description": "Credit a correct final value supported by the stated work. Do not invent a missing final value.",
+      "max_score": "1"
+    }
+  ],
+  "total_score": "2"
+}

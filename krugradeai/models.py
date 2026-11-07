@@ -178,6 +178,7 @@ class TAReference(Contract):
 
 
 class ReflectorInput(Contract):
+    reference_total_score_origin: Literal["original_ta", "ai_generated", "missing", "unknown"] = "unknown"
     record: GradingRecord
     ta_output: GraderOutput | TAReference | None = None
 
