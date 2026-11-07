@@ -1,13 +1,16 @@
 """Portable configuration entry point for the existing three-agent loop only."""
 import argparse
+from krugradeai.model_routing import ModelRoutingError
 import json
 from pathlib import Path
 from typing import Literal
 
 from pydantic import Field, model_validator
 
-from krugradeai.artifact_paths import output_directory
-from krugradeai.codex_provider import CodexCLIProvider
+from uuid import uuid4
+from krugradeai.artifact_paths import output_directory, claim_live_directory
+from krugradeai.prediction_reporting import prediction_report
+from krugradeai.codex_provider import CodexCLIProvider, CodexOutputError
 from krugradeai.grader import LLMGrader
 from krugradeai.models import AdaptationRules, Contract, ReflectorOutput, Text
 from krugradeai.optimization import OptimizationLoop
@@ -22,24 +25,36 @@ from krugradeai.prompt_transport import PromptProvider
 from krugradeai.models import GraderInput, StudentResponse
 
 
+from krugradeai.model_routing import ModelRoutes
+
+
+class PreflightBudgetError(ValueError):
+    """Safe, numeric preflight error for the CLI."""
+
+
 class OptimizationConfig(Contract):
     development: Text
     output_directory: Text
-    runtime: Literal["synthetic_mock", "codex_cli"] = "synthetic_mock"
+    runtime: Literal["synthetic_mock", "schema_mock", "codex_cli"] = "synthetic_mock"
     prompt_file: Text | None = None
     validation: Text | None = None
     validation_config: ValidationConfig = Field(default_factory=ValidationConfig)
-    model: Text | None = None
+    models: ModelRoutes = Field(default_factory=ModelRoutes)
+    model: Text | None = None  # Legacy Grader-only override
     executable: Text | None = None
     timeout_seconds: float = Field(default=120, gt=0, allow_inf_nan=False)
     max_iterations: int = Field(default=1, ge=1, le=10, strict=True)
     max_calls: int = Field(default=32, ge=1, strict=True)
+    review_policy: Literal["strict", "ai_assisted_pilot"] = "strict"
+    cli_request_retries: Literal[0] = 0
+    cli_stream_retries: Literal[0] = 0
+    retry_malformed_output: bool = False
     initial_rules: AdaptationRules = Field(default_factory=AdaptationRules)
 
     @model_validator(mode="after")
     def explicit_model(self):
-        if self.runtime == "codex_cli" and self.model is None:
-            raise ValueError("Live optimization requires an explicit model")
+        if self.model and "models" in self.model_fields_set and self.models.grader != self.model:
+            raise ValueError("Conflicting Grader model settings")
         return self
 
 
@@ -49,14 +64,22 @@ class _Budget:
 
 
 class _BoundedProvider(LLMProvider):
-    def __init__(self, provider, budget):
+    def __init__(self, provider, budget, retry_malformed_output=False):
         self.provider, self.budget = provider, budget
+        self.retry_malformed_output = retry_malformed_output
 
     def generate(self, request):
-        if self.budget.calls >= self.budget.maximum:
-            raise RuntimeError("Shared optimization call budget exhausted")
-        self.budget.calls += 1
-        return self.provider.generate(request)
+        for attempt in range(1 + int(self.retry_malformed_output)):
+            if self.budget.calls >= self.budget.maximum:
+                raise RuntimeError("Shared optimization call budget exhausted")
+            self.budget.calls += 1
+            try:
+                return self.provider.generate(request)
+            except CodexOutputError:
+                if attempt or not self.retry_malformed_output:
+                    raise
+
+
 
 
 def load_config(path):
@@ -64,6 +87,8 @@ def load_config(path):
     config = OptimizationConfig.model_validate_json(path.read_bytes())
     # Input/output paths resolve relative to the config, never a developer's CWD.
     data = config.model_dump()
+    if config.model:
+        data["models"]["grader"] = config.model
     for field in ("development", "output_directory", "validation", "prompt_file"):
         if data[field] is None:
             continue
@@ -109,6 +134,8 @@ def run(config_path, *, live=False, dry_run=False):
         raise ValueError("Live and dry-run are mutually exclusive")
     if config.runtime == "codex_cli" and not (live or dry_run):
         raise ValueError("Codex execution requires explicit --live")
+    if config.review_policy == "ai_assisted_pilot" and config.runtime != "codex_cli":
+        raise ValueError("AI-assisted pilot requires the Codex CLI runtime")
     records, required, content = prepare_run(config)
     validation_records, validation_content = None, None
     if config.validation:
@@ -116,6 +143,16 @@ def run(config_path, *, live=False, dry_run=False):
         validation_records = tuple(ValidationRecord.model_validate_json(line)
             for line in validation_content.decode("utf-8").splitlines() if line.strip())
         prepare_validation(records, validation_records, config.validation_config)
+        if config.runtime == "codex_cli":
+            from krugradeai.synthetic import make_synthetic_dataset
+            fixtures = set(r.model_dump_json() for r in make_synthetic_dataset(multiple_rubrics=True).validation)
+            for row in validation_records:
+                if row.model_dump_json() in fixtures:
+                    continue
+                provenance = row.provenance
+                if not provenance or not (provenance.source_dataset == "untitled" and
+                        provenance.score_origin == "original_ta" and provenance.benchmark_eligible is True):
+                    raise ValueError("Real Validation requires explicit benchmark-eligible original TA provenance")
         required += (config.max_iterations + 1) * len(validation_records)
         if config.max_calls < required:
             raise ValueError("Budget must also reserve baseline and candidate Validation calls")
@@ -126,6 +163,18 @@ def run(config_path, *, live=False, dry_run=False):
                 reserved_maximum_calls=required, configured_max_calls=config.max_calls,
                 max_iterations=config.max_iterations, runtime=config.runtime,
                 validation_loaded=validation_records is not None, heldout_loaded=False)
+    if config.review_policy == "ai_assisted_pilot":
+        plan["review_policy"] = config.review_policy
+        plan["potential_review_calls"] = 2*config.max_iterations*len(records) + (config.max_iterations+1)*len(validation_records or ())
+    # Ordinary calls can retry malformed output once if explicitly enabled.
+    # Adjudication and diagnostic passes have no retries.
+    projected = required * (2 if config.retry_malformed_output else 1) + plan.get("potential_review_calls", 0)
+    plan.update(projected_maximum_calls=projected, reserved_maximum_calls=projected,
+                cli_request_retries=0, cli_stream_retries=0)
+    if projected > config.max_calls:
+        raise PreflightBudgetError(f"Projected maximum {projected} exceeds hard cap {config.max_calls}")
+    if config.runtime == "codex_cli" and config.validation_config.comparison_record_ids is not None:
+        raise ValueError("Live experiments require full fixed Validation coverage")
     if dry_run:
         return plan
     destination = Path(config.output_directory)
@@ -138,12 +187,13 @@ def run(config_path, *, live=False, dry_run=False):
         raise ValueError("Output must not contain Validation inputs")
     if destination.exists():
         raise FileExistsError("Use a fresh output directory; no overwrite/resume")
-    output_directory(destination)
+    (claim_live_directory if live else output_directory)(destination)
+    plan["experiment_id"] = uuid4().hex
     budget = _Budget(config.max_calls)
     stage = "configuration"
 
     def record_status(status, error_type=None):
-        payload = dict(status=status, stage=stage, provider_calls=budget.calls)
+        payload = dict(experiment_id=plan["experiment_id"], status=status, stage=stage, provider_calls=budget.calls)
         if error_type is not None:
             payload["error_type"] = error_type
         (destination/"status.json").write_text(json.dumps(payload, indent=2)+"\n", encoding="utf-8")
@@ -152,19 +202,55 @@ def run(config_path, *, live=False, dry_run=False):
         record_status("running")
         (destination/"configuration.json").write_text(config.model_dump_json(indent=2),encoding="utf-8")
         stage = "providers"
+        validation_grader = None
         if config.runtime == "synthetic_mock":
             agents = build_mock_agents()
+        elif config.runtime == "schema_mock":
+            from krugradeai.schema_mock import SchemaMockProvider
+            agents = (LLMGrader(SchemaMockProvider('grader')),
+                      LLMReflector(SchemaMockProvider('reflector')),
+                      LLMRefiner(SchemaMockProvider('refiner')))
         else:
-            settings = dict(model=config.model, executable=config.executable, timeout_seconds=config.timeout_seconds)
-            agents = (LLMGrader(CodexCLIProvider(**settings)),
-                      LLMReflector(CodexCLIProvider(**settings, output_model=ReflectorOutput)),
-                      LLMRefiner(CodexCLIProvider(**settings, output_model=AdaptationRules)))
+            def provider(role, output_model=None):
+                return CodexCLIProvider(model=getattr(config.models, role), role=role,
+                    invocation_log=destination/"provider-invocations.jsonl", executable=config.executable,
+                    timeout_seconds=config.timeout_seconds, output_model=output_model, disable_cli_retries=True)
+            agents = (LLMGrader(provider("grader")), LLMReflector(provider("reflector", ReflectorOutput)),
+                      LLMRefiner(provider("refiner", AdaptationRules)))
+            if validation_records:
+                backend = _BoundedProvider(provider("validation_grader"), budget, config.retry_malformed_output)
+                validation_grader = LLMGrader(PromptProvider(backend, instructions) if config.prompt_file else backend)
         for agent in agents:
-            agent.provider = _BoundedProvider(agent.provider, budget)
+            agent.provider = _BoundedProvider(agent.provider, budget, config.retry_malformed_output)
         if config.prompt_file:
             agents[0].provider = PromptProvider(agents[0].provider, instructions)
+        if config.review_policy == "ai_assisted_pilot":
+            from krugradeai.assisted_review import AssistedGrader, AssistedReflector, ReviewDecision
+            def reviewer(role, schema):
+                provider = CodexCLIProvider(model="gpt-6-astra", role=role, output_model=schema, disable_cli_retries=True,
+                    invocation_log=destination/"provider-invocations.jsonl", executable=config.executable,
+                    timeout_seconds=config.timeout_seconds)
+                return _BoundedProvider(provider, budget)
+            audit_path = destination/"assisted-reviews.jsonl"
+            assessor = reviewer("ai_adjudicator", ReviewDecision)
+            agents = (AssistedGrader(agents[0], assessor, audit_path, "development"),
+                      AssistedReflector(agents[1], reviewer("reflector_diagnostic", ReflectorOutput), audit_path),
+                      agents[2])
+            if validation_grader is not None:
+                validation_grader = AssistedGrader(validation_grader, assessor, audit_path, "validation")
+        validation_history = {}
+        def observe(tracker, evaluation):
+            scope = tracker.records[0].rubric.id
+            entry = prediction_report(evaluation, tracker.records)
+            entry.update(scope=scope, best_version=tracker.best_version,
+                         patience=tracker.non_improving, selection_metric=tracker.config.primary_metric,
+                         status="ineligible" if not evaluation.eligible else "baseline" if evaluation.version==0
+                         else "new_best" if tracker.best_version==evaluation.version else "retained_earlier_best")
+            validation_history.setdefault(scope, []).append(entry)
+            with (destination/"validation-history.jsonl").open("a",encoding="utf-8") as stream:
+                stream.write(json.dumps(entry)+"\n")
         protected = tuple(r.model_dump_json() for r in records)
-        loop = OptimizationLoop(grader=agents[0],reflector=agents[1],refiner=agents[2],
+        loop = OptimizationLoop(fail_fast=live, validation_observer=observe, validation_grader=validation_grader, grader=agents[0],reflector=agents[1],refiner=agents[2],
                                 max_iterations=config.max_iterations, validation_config=config.validation_config)
         stage = "optimization"
         result = loop.run(records,config.initial_rules, validation_records=validation_records)
@@ -204,6 +290,13 @@ def run(config_path, *, live=False, dry_run=False):
                                    latest_version=p.final_version) for p in result.paths],
                        prompt_exports=exports,
                        selection="Validation-selected rules" if validation_records is not None else "No Validation provided: latest proposal is not a best-guidelines claim")
+        summary["scope_reports"] = [dict(scope=p.rubric_id, selected_version=p.validation.best_version if p.validation else None,
+            formal_test_version=(p.validation.best_version if p.validation and p.validation.best_version is not None else 0),
+            selection_reason=("earliest eligible minimum of the configured Validation metric" if p.validation and p.validation.best_version is not None
+                              else "no eligible Validation version" if p.validation else "Development-only proposal; use G0 for formal Test"),
+            generation_history=[dict(iteration=i.iteration, parent_version=i.rules_version,
+                                     candidate_version=i.candidate_version, stop_reason=i.stop_reason) for i in p.history],
+            validation_history=validation_history.get(p.rubric_id, []), stop_reason=p.stop_reason) for p in result.paths]
         with (destination/"summary.json").open("x",encoding="utf-8") as stream:
             json.dump(summary,stream,indent=2)
         stage = "finished"
@@ -230,6 +323,10 @@ def main(argv=None):
     args=parser.parse_args(argv)
     try:
         result=run(args.config,live=args.live,dry_run=args.dry_run)
+    except PreflightBudgetError as error:
+        parser.exit(1,f"Optimization refused: {error}\n")
+    except ModelRoutingError as error:
+        parser.exit(1, f"Model routing failed: {error}\n")
     except Exception as error:
         parser.exit(1,f"Optimization refused/incomplete ({type(error).__name__}); no private input printed, no automatic retry.\n")
     print(json.dumps(result,indent=2))

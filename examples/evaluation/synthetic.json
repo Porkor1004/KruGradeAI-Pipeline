@@ -4,5 +4,13 @@
   "prompt_file": "grader.txt",
   "mock_responses": "responses.json",
   "runtime": "mock",
-  "output_directory": "../../artifacts/independent-evaluation-example-001"
+  "output_directory": "../../artifacts/independent-evaluation-example-001",
+  "models": {
+    "grader": "gpt-6-luna",
+    "reflector": "gpt-6-astra",
+    "refiner": "gpt-6-astra",
+    "validation_grader": "gpt-6-luna",
+    "evaluation_grader": "gpt-6-luna",
+    "heldout_grader": "gpt-6-luna"
+  }
 }

@@ -13,7 +13,8 @@ from krugradeai.synthetic import make_synthetic_dataset
 
 class PortableOptimizationTests(unittest.TestCase):
     def setUp(self):
-        self.temp=tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
+        artifacts=Path(__file__).resolve().parents[1]/'artifacts'; artifacts.mkdir(exist_ok=True)
+        self.temp=tempfile.TemporaryDirectory(dir=artifacts); self.addCleanup(self.temp.cleanup)
         self.root=Path(self.temp.name); self.config=self.root/'config.json'
         self.records=make_synthetic_dataset(multiple_rubrics=True).development
         self.input=self.root/'development.jsonl'
@@ -51,7 +52,8 @@ class PortableOptimizationTests(unittest.TestCase):
         with self.assertRaises(FileExistsError): run(self.config)
 
     def test_live_requires_opt_in_and_explicit_model(self):
-        with self.assertRaises(ValueError): self.write_config(runtime='codex_cli'); load_config(self.config)
+        self.write_config(runtime='codex_cli')
+        self.assertEqual(load_config(self.config).models.grader, 'gpt-6-luna')
         self.write_config(runtime='codex_cli',model='synthetic-model')
         with patch('krugradeai.run_optimization.CodexCLIProvider') as provider:
             with self.assertRaises(ValueError): run(self.config)
@@ -87,7 +89,7 @@ class PortableOptimizationTests(unittest.TestCase):
         self.assertEqual(result['paths'][0]['stop_reason'],'no_discrepancies')
         self.assertEqual(result['provider_calls'],1)
         for call in build.call_args_list:
-            self.assertEqual(call.kwargs['model'],'test-model')
+            self.assertEqual(call.kwargs['model'], 'test-model' if call.kwargs['role']=='grader' else 'gpt-6-astra')
             self.assertEqual(call.kwargs['executable'],str(self.root/'tool'/'codex.exe'))
         self.assertNotIn('ta_output',json.loads(provider.requests[0].split('\nINPUT_JSON\n')[1]))
 
@@ -105,6 +107,7 @@ class PortableOptimizationTests(unittest.TestCase):
                 run(self.config)
         output = self.root/'output'
         status = json.loads((output/'status.json').read_bytes())
+        self.assertRegex(status.pop('experiment_id'), r'^[0-9a-f]{32}$')
         self.assertEqual(status, dict(status='failed', stage='providers', provider_calls=0, error_type='RuntimeError'))
         self.assertTrue((output/'configuration.json').exists())
         self.assertNotIn('PRIVATE', (output/'status.json').read_text())

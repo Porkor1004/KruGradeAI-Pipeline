@@ -4,5 +4,15 @@
   "runtime": "synthetic_mock",
   "max_iterations": 1,
   "max_calls": 10,
-  "initial_rules": {"rules": []}
+  "initial_rules": {
+    "rules": []
+  },
+  "models": {
+    "grader": "gpt-6-luna",
+    "reflector": "gpt-6-astra",
+    "refiner": "gpt-6-astra",
+    "validation_grader": "gpt-6-luna",
+    "evaluation_grader": "gpt-6-luna",
+    "heldout_grader": "gpt-6-luna"
+  }
 }

@@ -1,5 +1,6 @@
 """Evaluate an external prompt and teacher rubric without optimization."""
 import argparse
+from krugradeai.model_routing import ModelRoutingError
 import json
 from krugradeai.evaluation import run
 
@@ -13,6 +14,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         result = run(args.config, live=args.live, dry_run=args.dry_run)
+    except ModelRoutingError as error:
+        parser.exit(1, f"Model routing failed: {error}\n")
     except Exception as error:
         parser.exit(1, f"Evaluation refused/incomplete ({type(error).__name__}); private input withheld.\n")
     print(json.dumps({k: v for k, v in result.items() if k in ("status", "metrics", "metrics_by_label_origin", "records", "maximum_calls", "runtime")}, indent=2))

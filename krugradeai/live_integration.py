@@ -138,7 +138,8 @@ class _IntegrationBoundary:
         try:
             if not any(e.agent == "reflector" for e in self.recorder.events):
                 try:
-                    reflection = _invoke(self.reflector.reflect, ReflectorInput(record=outcome.grading, ta_output=record.ta_output))
+                    reflection = _invoke(self.reflector.reflect, ReflectorInput(record=outcome.grading, ta_output=record.ta_output,
+                        reference_total_score_origin=(record.provenance.score_origin if record.provenance else None) or "unknown"))
                     if reflection.human_review_required:
                         self.reviews.append(HumanReviewFlag(stage="reflector", record_id=record.id, reasons=("Development probe requires human review.",)))
                 except HumanReviewRequired:

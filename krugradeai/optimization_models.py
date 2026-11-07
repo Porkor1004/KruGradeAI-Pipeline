@@ -21,7 +21,30 @@ class RecordProvenance(Contract):
     source: Text
     item_id: Text
     # Optional for legacy/synthetic records; explicit on real-data imports.
-    label_origin: Literal["human_derived", "ai_derived"] | None = None
+    label_origin: Literal["human_derived", "ai_derived", "unverified"] | None = None
+    split_group: Text | None = None
+    source_ids: tuple[Text, ...] = ()
+    generation_kind: Text | None = None
+    reference_origin: Text | None = None
+    answer_origin: Literal['original_student', 'ai_augmented', 'fully_synthetic', 'unknown'] | None = None
+    score_origin: Literal['original_ta', 'ai_generated', 'missing', 'unknown'] | None = None
+    ocr_review_origin: Literal['human', 'ai', 'unknown'] | None = None
+    rubric_origin: Literal['teacher_supplied', 'ai_generated', 'unknown'] | None = None
+    source_dataset: Literal['zip', 'untitled'] | None = None
+    source_response_id: Text | None = None
+    response_id: Text | None = None
+    benchmark_eligible: bool | None = None
+    benchmark_evidence: tuple[Text, ...] = ()
+    score_evidence: tuple[Text, ...] = ()
+
+    @model_validator(mode='after')
+    def consistent_explicit_origins(self):
+        if self.score_origin == 'ai_generated' and self.label_origin == 'human_derived':
+            raise ValueError('AI-generated scores cannot be human-derived labels')
+        if self.benchmark_eligible is True and self.source_dataset is not None:
+            if not (self.answer_origin == 'original_student' and self.score_origin == 'original_ta' and self.ocr_review_origin == 'human' and self.rubric_origin == 'teacher_supplied'):
+                raise ValueError('Benchmark eligibility requires original TA-scored student work, human OCR review and teacher rubric')
+        return self
 
 
 class DevelopmentRecord(Contract):
@@ -92,6 +115,7 @@ class HumanReviewFlag(Contract):
 
 
 class RecordHistory(Contract):
+    ai_adjudicated: bool = False
     record_id: Text
     grading: GradingRecord | None = None
     discrepancy: bool | None = None

@@ -7,5 +7,13 @@
   "initial_rules": {
     "rules": []
   },
-  "validation": "synthetic-validation.jsonl"
+  "validation": "synthetic-validation.jsonl",
+  "models": {
+    "grader": "gpt-6-luna",
+    "reflector": "gpt-6-astra",
+    "refiner": "gpt-6-astra",
+    "validation_grader": "gpt-6-luna",
+    "evaluation_grader": "gpt-6-luna",
+    "heldout_grader": "gpt-6-luna"
+  }
 }

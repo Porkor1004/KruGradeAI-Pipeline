@@ -82,6 +82,23 @@ class ValidationOptimizationTests(unittest.TestCase):
         self.assertEqual(output.paths[0].stop_reason, "no_change")
         self.assertEqual(len(output.paths[0].validation.evaluations), 1)
 
+    def test_invalid_evaluation_does_not_consume_patience(self):
+        path = run({0: "2", 1: HumanReviewRequired("Unreadable"), 2: "2", 3: "1"},
+                   maximum=3).paths[0]
+        self.assertEqual([e.eligible for e in path.validation.evaluations], [True, False, True, True])
+        self.assertEqual(path.stop_reason, "max_iterations")
+        self.assertEqual(path.validation.best_version, 3)
+        self.assertEqual(path.validation.non_improving_iterations, 0)
+
+    def test_improve_regress_improve_uses_latest_parent_and_resets_patience(self):
+        path = run({0: "2", 1: "1.5", 2: "2", 3: "1"}, maximum=3).paths[0]
+        self.assertEqual([(v.version, v.parent_version) for v in path.rule_versions],
+                         [(0, None), (1, 0), (2, 1), (3, 2)])
+        self.assertEqual([e.metrics.mae for e in path.validation.evaluations],
+                         [1, Decimal("0.5"), 1, 0])
+        self.assertEqual(path.validation.non_improving_iterations, 0)
+        self.assertEqual(path.validation.best_version, 3)
+
     def test_incomplete_candidate_cannot_beat_complete_baseline(self):
         scores = {0: "2", 1: {"val-1-response": "1", "val-2-response": RuntimeError("PRIVATE")}}
         output = run(scores, maximum=1, values=[validation(), validation("val-2")])

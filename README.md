@@ -96,8 +96,7 @@ guaranteed deterministic; effective model identity remains unknown without evide
 
 ### Execution, compatibility and limitations
 
-Both CLIs support `--dry-run`. Configured `codex_cli` execution requires an explicit
-model and `--live`. No model was added and verification uses mocks only. Codex CLI
+Both CLIs support `--dry-run`. Configured `codex_cli` execution uses explicit per-role model IDs and requires `--live`. No model was added and verification uses mocks only. Codex CLI
 task-text instructions are **not necessarily native system-role messages**: the
 existing provider transports policy and task text through CLI stdin.
 
@@ -227,6 +226,14 @@ candidate is a proposal, not evidence of improvement.
 
 ## Data and rubrics
 
+For a complete private source inventory, use the opt-in exhaustive workflow in
+[full dataset preparation](docs/full_dataset_preparation.md). It retains every
+physical source row and its disposition, keeps unknown label provenance separate,
+and exercises both independent pipelines offline without the historical selection
+policy. The historical `real_data` preparation remains unchanged for replay.
+Use the documented `corrected_dataset` / `corrected_audit` workflow for the
+owner-clarified TA-score and OCR-review provenance and the three-way split.
+
 The portable runner reads UTF-8 JSONL with one `DevelopmentRecord` per line.
 Each record contains `id`, `split: "development"`, `question`, `rubric`, `response`,
 `ta_output` and optional `provenance`. See the
@@ -354,3 +361,21 @@ Small grouped samples, uncertain transcription/label provenance and Validation
 reuse limit conclusions about generalization. AI-label agreement is not human
 grading accuracy. The original legacy system prompt is still missing, so the
 baseline-comparison module has no verified real legacy-prompt result.
+
+## Live model routing
+
+The `models` object in the synthetic configs specifies all six routes. Grader, Validation, independent evaluation and held-out Test default to `gpt-6-luna`. Reflector and Refiner default to `gpt-6-astra`. Set evaluation `role` to `heldout_grader` for Test. A legacy `model` value overrides only the Grader for that pipeline. Each live invocation passes an explicit CLI model. The private `provider-invocations.jsonl` records role, requested ID, reported effective ID and invocation status. A successful Codex CLI turn records verification_status=requested_only. A missing effective model is recorded as null. The adapter checks turn completion, CLI exit status, reported routing conflicts and the output contract before returning a result. Exact CLI arguments are logged privately; prompts and credentials travel outside the argument list.
+
+### Exploratory AI-assisted review
+
+Set `review_policy` to `ai_assisted_pilot` in a Codex CLI optimization config to enable this experiment. The default is `strict`. A Grader review can trigger one independent Astra assessment of the answer, rubric, rules and review reason. A provisional score is labeled `ai_adjudicated` in the private review log and grade feedback. Abstention preserves the unresolved review. This applies to both Development and Validation grading. Any resulting Validation metric measures the assisted grading process.
+
+A Development Reflector review can trigger one Astra diagnostic pass with the original findings and labeled Development evidence. The existing reflector checks must accept the quotes, arithmetic and criterion evidence before a supported adaptation can reach Refiner. The pilot follows the existing stop-path policy on unresolved Development reviews; an unresolved Validation grade reduces coverage. Each extra invocation charges the shared call budget. The private `assisted-reviews.jsonl` records the original decision and adjudication outcome. Strict and assisted experiment results should be identified by policy when reporting them.
+
+### Standard experiment execution and reporting
+
+The live optimizer claims a fresh directory under Git-ignored `artifacts/` and assigns an experiment ID. Dry-run the exact config first. Preflight reserves all ordinary calls, optional malformed-output retries, and one possible assessment or diagnostic per eligible review. Demand above `max_calls` rejects both dry-run and live execution. All agents share that cap. For subscription runs both CLI retry settings are fixed at zero. Set `retry_malformed_output: false` to disable the separate application retry. An unresolved review, invalid agent output after any permitted retry, provider error, or budget failure stops live execution. Inspect the fresh directory before starting another experiment.
+
+`validation-history.jsonl` checkpoints each evaluated scope/version. The final `summary.json` includes generation history, patience and selected versions. Each breakdown reports the fixed population, label origins, direct-only and adjudicated-only coverage and MAE, and combined-policy MAE. MAE denominators count successful predictions in the corresponding cohort. Coverage uses the whole declared population. A direct-only MAE on a changing subset cannot substitute for selection MAE. Compare versions under the same review policy on the same original-TA Validation records, requiring complete coverage. The earliest minimum wins. Report any differences in adjudication incidence even when coverage is equal.
+
+Use three iterations, patience two and minimum delta zero for the full experiment. Candidates derive from the latest rules. Export the selected best for covered scopes. Development-only proposals have no selected Validation version; use G0 for formal Test until compatible independent Validation evidence is available. Independent evaluation reports the same prediction breakdown and performs no selection. Supply `guideline_version` when evaluating a known version.

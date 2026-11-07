@@ -94,7 +94,7 @@ class IndependentPipelineTests(unittest.TestCase):
                 provider.assert_not_called()
 
     def test_live_opt_in_dry_run_and_relative_paths(self):
-        config = self.config('evaluation/synthetic.json', runtime='codex_cli', model='test-only')
+        config = self.config('evaluation/synthetic.json', runtime='codex_cli', model='gpt-6-luna')
         with patch('krugradeai.evaluation.CodexCLIProvider') as provider:
             with self.assertRaises(ValueError):
                 run(config)

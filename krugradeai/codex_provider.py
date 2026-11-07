@@ -7,6 +7,8 @@ import re
 import shutil
 import subprocess
 import tempfile
+import uuid
+from krugradeai.model_routing import ModelRoutingError
 from pathlib import Path
 from typing import Any
 
@@ -217,6 +219,60 @@ def _reject_constant(value: str) -> None:
     raise ValueError("Non-finite response value")
 
 
+def _retain_invalid_final(log_path, invocation_id, raw):
+    """Store only final-message bytes, inside the ignored private artifact tree."""
+    artifact_root = Path(__file__).resolve().parents[1] / "artifacts"
+    target = (log_path.parent / "invalid-finals" / (invocation_id + ".bin")).resolve()
+    if not target.is_relative_to(artifact_root):
+        return None
+    check = subprocess.run(["git", "check-ignore", "-q", "--", str(target)],
+                           cwd=artifact_root.parent, capture_output=True)
+    if check.returncode != 0:
+        return None
+    target.parent.mkdir(mode=0o700, exist_ok=True)
+    if os.name == "nt":
+        import csv
+        identity = subprocess.check_output(["whoami", "/user", "/fo", "csv", "/nh"], text=True)
+        sid = next(csv.reader(identity.splitlines()))[-1]
+        subprocess.run(["icacls", str(target.parent), "/inheritance:r", "/grant:r", f"*{sid}:(OI)(CI)F"],
+                       check=True, capture_output=True)
+    with os.fdopen(os.open(target, os.O_WRONLY | os.O_EXCL | os.O_CREAT, 0o600), "wb") as stream:
+        stream.write(raw)
+    return str(target.relative_to(log_path.parent.resolve()))
+
+
+def _completed_turn(stdout, requested_model):
+    """Validate the exec event stream without inferring identity from agent output."""
+    state = "waiting"
+    reported = None
+    for line in (stdout or "").splitlines():
+        try:
+            event = json.loads(line, object_pairs_hook=_unique_object)
+            kind = event["type"]
+        except (ValueError, KeyError, TypeError):
+            raise ModelRoutingError("Malformed Codex event stream") from None
+        if kind in ("turn.failed", "error"):
+            raise ModelRoutingError("Codex reported an unsuccessful turn")
+        if kind == "turn.started":
+            if state != "waiting":
+                raise ModelRoutingError("Unexpected additional Codex turn")
+            state = "running"
+        elif kind == "turn.completed":
+            if state != "running":
+                raise ModelRoutingError("Unexpected Codex completion")
+            state = "completed"
+            reported = event.get("effective_model")
+            if reported is not None and reported != requested_model:
+                raise ModelRoutingError("Reported completion model differs from requested route")
+        elif kind in ("model/rerouted", "model.rerouted"):
+            details = event.get("params", event)
+            if not isinstance(details, dict) or details.get("toModel") != requested_model:
+                raise ModelRoutingError("Codex reported an inconsistent model route")
+    if state != "completed":
+        raise ModelRoutingError("Codex turn did not complete")
+    return reported
+
+
 class CodexCLIProvider(LLMProvider):
     """One isolated, noninteractive Codex exec per generate call.
 
@@ -229,16 +285,36 @@ class CodexCLIProvider(LLMProvider):
                  timeout_seconds: float = 120.0,
                  temp_root: str | Path | None = None,
                  model: str | None = None,
+                 disable_cli_retries: bool = False,
+                 role: str | None = None,
+                 invocation_log: Path | None = None,
                  working_directory: str | Path | None = None) -> None:
         if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be finite and positive")
         if model is not None and (not isinstance(model, str) or not model.strip() or model.startswith("-") or any(c.isspace() for c in model)):
             raise ValueError("model must be a nonempty model identifier")
         self.model = model
+        self.role = role
+        self.invocation_log = invocation_log
+        self.effective_model = None
+        if role and (not model or invocation_log is None):
+            raise ModelRoutingError("A routed provider requires a model and private invocation log")
         self.working_directory = Path(working_directory).resolve() if working_directory is not None else None
         if self.working_directory is not None and not self.working_directory.is_dir():
             raise ValueError("working_directory must be an existing directory")
         self.command = resolve_codex_command(executable)
+        if disable_cli_retries:
+            self.command.extend([
+                "-c", 'model_provider="experiment_subscription"',
+                "-c", 'model_providers.experiment_subscription.name="OpenAI"',
+                "-c", "model_providers.experiment_subscription.requires_openai_auth=true",
+                "-c", "model_providers.experiment_subscription.request_max_retries=0",
+                "-c", "model_providers.experiment_subscription.stream_max_retries=0",
+            ])
+        self.grader_envelope = role in ("grader", "validation_grader", "evaluation_grader", "heldout_grader")
+        if self.grader_envelope:
+            from krugradeai.grader import CLIGraderResponse
+            output_model = CLIGraderResponse
         self.output_model = output_model
         self.schema = generate_output_schema(output_model) if output_model is not None else None
         self.timeout_seconds = timeout_seconds
@@ -254,6 +330,8 @@ class CodexCLIProvider(LLMProvider):
         except UnicodeError:
             raise ValueError("Prompt must be valid UTF-8 text") from None
         prompt = RUNTIME_POLICY + "\nTASK_REQUEST_JSON\n" + json.dumps({"task_request": request}, ensure_ascii=False)
+        if self.grader_envelope:
+            prompt = "Return one JSON object with the Grader score or human-review object in its result field, as specified by the output schema.\n" + prompt
         try:
             with tempfile.TemporaryDirectory(prefix="krugradeai-codex-", dir=self.temp_root) as temporary:
                 folder = Path(temporary).resolve()
@@ -272,43 +350,89 @@ class CodexCLIProvider(LLMProvider):
                     schema_file = folder / "schema.json"
                     schema_file.write_text(json.dumps(self.schema, ensure_ascii=False), encoding="utf-8")
                     args.extend(["--output-schema", str(schema_file)])
+                invocation_id = uuid.uuid4().hex
+                def log(status, effective=None, **details):
+                    if self.role:
+                        entry = dict(invocation_id=invocation_id, role=self.role, requested_model=self.model,
+                                     effective_model=effective, verification_status="requested_only", argv=list(args),
+                                     exit_status=exit_status, completion_status=completion_status, transport="codex exec", status=status,
+                                     sandbox="read-only", timeout_seconds=self.timeout_seconds, **details)
+                        with self.invocation_log.open("a", encoding="utf-8") as stream:
+                            stream.write(json.dumps(entry) + "\n")
+                def malformed(category, parser_error, raw=None):
+                    artifact = None
+                    if self.role and raw is not None:
+                        artifact = _retain_invalid_final(self.invocation_log, invocation_id, raw)
+                    log("malformed_output", self.effective_model, failure_category=category,
+                        parser_error=parser_error, diagnostic_file=artifact)
+
+                if self.role:
+                    args.append("--json")
                 args.append("-")
+                self.effective_model = None
+                exit_status = None
+                completion_status = "not_started"
+                log("started")
                 try:
                     completed = subprocess.run(
                         args, input=prompt, text=True, encoding="utf-8", errors="replace",
                         cwd=str(work), shell=False, timeout=self.timeout_seconds,
-                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                        stdout=subprocess.PIPE if self.role else subprocess.DEVNULL, stderr=subprocess.PIPE,
                         env={key: value for key, value in os.environ.items()
                              if key.upper() not in {"OPENAI_API_KEY", "CODEX_API_KEY", "AZURE_OPENAI_API_KEY"}},
                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                     )
                 except subprocess.TimeoutExpired:
+                    log("timeout")
                     raise CodexTimeoutError("Codex exec exceeded the configured timeout; no response accepted.") from None
                 except FileNotFoundError:
+                    log("launch_failed")
                     raise CodexNotFoundError("The resolved Codex executable is unavailable.") from None
                 except OSError:
+                    log("launch_failed")
                     raise CodexCLIError("Unable to start Codex exec; check executable permissions and installation.") from None
+                exit_status = completed.returncode
+                completion_status = "incomplete"
                 if completed.returncode != 0:
+                    log("cli_failure", returncode=completed.returncode)
+                    if self.role:
+                        raise ModelRoutingError(f"Codex refused the {self.role} invocation for {self.model} (exit {completed.returncode})")
                     raise _process_error(completed.returncode, completed.stderr)
                 try:
-                    response = final.read_text(encoding="utf-8")
-                except (OSError, UnicodeError):
+                    if self.role:
+                        try:
+                            self.effective_model = _completed_turn(completed.stdout, self.model)
+                        except ModelRoutingError:
+                            log("turn_rejected")
+                            raise
+                        completion_status = "completed"
+                    raw = final.read_bytes()
+                    response = raw.decode("utf-8")
+                except (OSError, UnicodeError) as error:
+                    malformed("unreadable_final", type(error).__name__, raw if isinstance(error, UnicodeError) else None)
                     raise CodexOutputError("Codex did not produce a readable UTF-8 final response file.") from None
                 if not response.strip():
+                    malformed("empty_final", "Empty final response", raw)
                     raise CodexOutputError("Codex produced an empty final response.")
                 try:
                     data = json.loads(response, object_pairs_hook=_unique_object, parse_constant=_reject_constant)
                     if not isinstance(data, dict):
                         raise ValueError("Expected JSON object")
-                except ValueError:
+                except ValueError as error:
+                    reason = f"{error.msg} at offset {error.pos}" if isinstance(error, json.JSONDecodeError) else "Invalid JSON value or object structure"
+                    malformed("invalid_json", reason, raw)
                     raise CodexJSONError("Codex final response is not a valid single JSON object; no repair or retry was made.") from None
                 if self.output_model is not None:
                     try:
-                        self.output_model.model_validate_json(response)
+                        validated = self.output_model.model_validate_json(response)
+                        if self.grader_envelope:
+                            response = validated.result.model_dump_json()
                     except ValidationError as error:
+                        malformed("schema_validation", sorted({e["type"] for e in error.errors()}), raw)
                         failure = CodexValidationError("Codex JSON failed the configured Pydantic output contract; inspect safe_diagnostics for constraint codes. No retry was made.")
                         failure.safe_diagnostics = validation_details(error, self.output_model, "provider_output_contract")
                         raise failure from None
+                log("completed", self.effective_model)
                 return response
         except OSError:
             raise CodexCLIError("Unable to create or clean up the temporary Codex workspace.") from None

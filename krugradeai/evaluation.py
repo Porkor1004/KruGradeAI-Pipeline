@@ -3,10 +3,12 @@ import hashlib
 import json
 import platform
 from pathlib import Path
+from uuid import uuid4
 from typing import Literal
 
 from pydantic import Field, model_validator
-from krugradeai.artifact_paths import output_directory
+from krugradeai.artifact_paths import output_directory, claim_live_directory
+from krugradeai.prediction_reporting import prediction_report
 from krugradeai.codex_provider import CodexCLIProvider
 from krugradeai.grader import LLMGrader
 from krugradeai.metrics import ScorePair, calculate_metrics
@@ -22,6 +24,9 @@ class EvaluationRecord(DevelopmentRecord):
     split: Literal["evaluation"] = "evaluation"
 
 
+from krugradeai.model_routing import ModelRoutes
+
+
 class EvaluationConfig(Contract):
     dataset: Text
     rubric_file: Text
@@ -29,6 +34,9 @@ class EvaluationConfig(Contract):
     output_directory: Text
     runtime: Literal["mock", "codex_cli"] = "mock"
     mock_responses: Text | None = None
+    models: ModelRoutes = Field(default_factory=ModelRoutes)
+    role: Literal["evaluation_grader", "heldout_grader"] = "evaluation_grader"
+    guideline_version: int | None = Field(default=None, ge=0, strict=True)
     model: Text | None = None
     executable: Text | None = None
     timeout_seconds: float = Field(default=120, gt=0, allow_inf_nan=False)
@@ -38,14 +46,16 @@ class EvaluationConfig(Contract):
     def runtime_settings(self):
         if self.runtime == "mock" and self.mock_responses is None:
             raise ValueError("Mock execution requires explicit scripted responses")
-        if self.runtime == "codex_cli" and self.model is None:
-            raise ValueError("An explicit model is required")
+        if self.model and "models" in self.model_fields_set and self.model != getattr(self.models, self.role):
+            raise ValueError("Conflicting evaluation model settings")
         return self
 
 
 def load_config(path):
     path = Path(path).resolve()
     data = EvaluationConfig.model_validate_json(path.read_bytes()).model_dump()
+    if data["model"]:
+        data["models"][data["role"]] = data["model"]
     for key in ("dataset", "rubric_file", "prompt_file", "output_directory", "mock_responses"):
         if data[key] is not None:
             data[key] = str((path.parent / data[key]).resolve())
@@ -105,35 +115,47 @@ def run(config_path, *, live=False, dry_run=False):
         raise ValueError("Output must not contain inputs")
     if destination.exists():
         raise FileExistsError("Use a fresh output directory")
-    output_directory(destination)
-    (destination / "status.json").write_text('{"status":"running"}', encoding="utf-8")
+    (claim_live_directory if live else output_directory)(destination)
+    experiment_id = uuid4().hex
+    (destination / "status.json").write_text(json.dumps(dict(status="running",experiment_id=experiment_id)), encoding="utf-8")
     try:
         backend = ScriptedProvider(responses) if responses is not None else CodexCLIProvider(
-            model=config.model, executable=config.executable, timeout_seconds=config.timeout_seconds)
+            model=getattr(config.models, config.role), role=config.role, disable_cli_retries=True, invocation_log=destination/"provider-invocations.jsonl", executable=config.executable, timeout_seconds=config.timeout_seconds)
         provider = PromptProvider(backend, instructions)
-        result = evaluate_labeled_records(LLMGrader(provider), records, config.adaptation_rules, 0, ValidationConfig())
+        result = evaluate_labeled_records(LLMGrader(provider), records, config.adaptation_rules, 0, ValidationConfig(), fail_fast=live)
         outcomes = {r.record_id: r for r in result.records}
         groups = {}
-        for origin in ("human_derived", "ai_derived"):
+        for origin in ("human_derived", "ai_derived", "unverified"):
             group = [r for r in records if r.provenance.label_origin == origin]
             pairs = [ScorePair(predicted=outcomes[r.id].grading.grader_output.total_score,
                                reference=r.ta_output.total_score, maximum=r.rubric.total_score)
                      for r in group if outcomes[r.id].grading is not None]
             groups[origin] = calculate_metrics(pairs, expected_count=len(group)).model_dump(mode="json")
+        score_ocr_groups = {}
+        for score, ocr in sorted({(r.provenance.score_origin or 'unspecified', r.provenance.ocr_review_origin or 'unknown') for r in records}):
+            cohort = [r for r in records if (r.provenance.score_origin or 'unspecified', r.provenance.ocr_review_origin or 'unknown') == (score, ocr)]
+            pairs = [ScorePair(predicted=outcomes[r.id].grading.grader_output.total_score,
+                               reference=r.ta_output.total_score, maximum=r.rubric.total_score)
+                     for r in cohort if outcomes[r.id].grading is not None]
+            score_ocr_groups[score+'/'+ocr] = calculate_metrics(pairs, expected_count=len(cohort)).model_dump(mode='json')
         if any(Path(p).read_bytes() != content for p, content in snapshots.items()):
             raise ValueError("Inputs changed during evaluation")
         code = Path(__file__).parent
-        report = dict(schema_version=1, status="completed" if result.eligible else "incomplete",
+        report = dict(schema_version=1, experiment_id=experiment_id, status="completed" if result.eligible else "incomplete",
             configuration=config.model_dump(mode="json"), input_sha256={p: hashlib.sha256(b).hexdigest() for p,b in snapshots.items()},
             code_sha256={p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(code.glob("*.py"))},
             python_version=platform.python_version(), provider_calls=provider.calls,
-            model_requested=config.model, effective_model="unknown" if responses is None else "no_model_mock",
+            model_requested=getattr(config.models, config.role), effective_model=backend.effective_model if responses is None else "no_model_mock",
             metrics=result.metrics.model_dump(mode="json"), metrics_by_label_origin=groups,
+            metrics_by_score_and_ocr=score_ocr_groups,
+            prediction_breakdown=dict(prediction_report(result, records), scope=rubric.id,
+                version=config.guideline_version, selection_eligible=False, selection_mae=None, selected_version=None,
+                patience=None, generation_history=[], selection_reason="Independent evaluation is score-only"),
             evaluation=result.model_dump(mode="json"),
-            interpretation="AI-derived labels measure agreement, not human grading accuracy; mixed metrics are descriptive only.")
+            interpretation="Original TA labels are reported separately by OCR-review provenance. AI-generated labels measure pseudo-label agreement; mixed metrics are descriptive only.")
         (destination / "report.json").write_text(json.dumps(report, indent=2)+"\n", encoding="utf-8")
-        (destination / "status.json").write_text(json.dumps(dict(status=report["status"])), encoding="utf-8")
+        (destination / "status.json").write_text(json.dumps(dict(status=report["status"],experiment_id=experiment_id)), encoding="utf-8")
         return report
     except (Exception, KeyboardInterrupt) as error:
-        (destination / "status.json").write_text(json.dumps(dict(status="failed", error_type=type(error).__name__)), encoding="utf-8")
+        (destination / "status.json").write_text(json.dumps(dict(status="failed", experiment_id=experiment_id, error_type=type(error).__name__)), encoding="utf-8")
         raise
